@@ -6,6 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
+from model.event_fusion import EventFeatureFusion
+
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
 _RESNET_STD = [0.229, 0.224, 0.225]
@@ -30,7 +32,8 @@ class Backbone(nn.Module):
             self.vit_encoder = ViTAdapter(deform_num_heads=12 if arch_type == "b" else 6,
                                           with_cp=self.with_cp,
                                           vit_upsample_factor=self.vit_upsample_factor,
-                                          arch_type=arch_type)
+                                          arch_type=arch_type,
+                                          pretrained_model_path=getattr(args, "vit_pretrained_path", None))
             
         else:
             from model.vit_adapter.dinov2_adapter.dinov2_vit_adapter import ViTAdapter
@@ -48,6 +51,9 @@ class Backbone(nn.Module):
             nn.Sequential(nn.Linear(self.adapter_dim, self.D)),
             nn.Sequential(nn.Linear(self.adapter_dim, self.D))
         ])
+
+        event_channels = getattr(args, "event_channels", 0)
+        self.event_fusion = EventFeatureFusion(event_channels, self.D) if event_channels else None
 
         # === Positional embedding ===
 
@@ -80,7 +86,7 @@ class Backbone(nn.Module):
         return feat
 
         
-    def forward(self, video):
+    def forward(self, video, events=None):
         # :args video: (B, T, C, self.H, self.W) in range [0, 1]
         # :args queries: (B, N, 3) where 3 is (t, x, y)
         #
@@ -105,6 +111,11 @@ class Backbone(nn.Module):
         f8 = self.project_feat(f8, idx=1) + pos8                                                 # (B * T, D, H8, W8)           
         f16 = self.project_feat(f16, idx=2) + pos16                                              # (B * T, D, H16, W16)
         f32 = self.project_feat(f32, idx=3) + pos32                                              # (B * T, D, H32, W32)
+
+        if events is not None:
+            if self.event_fusion is None:
+                raise ValueError("events were provided, but event_channels is not configured")
+            f4, f8, f16, f32 = self.event_fusion((f4, f8, f16, f32), events)
         # === === ===
 
         # === Reshape & Permute ===

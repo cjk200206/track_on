@@ -8,4 +8,6 @@ av==16.0.1
 einshape==1.0
 dm-tree==0.1.9
 imageio==2.37.3
+h5py>=3.1.0
+hdf5plugin>=3.0.0
 einops==0.8.2

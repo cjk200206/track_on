@@ -1,0 +1,5 @@
+.vscode
+checkpoints/
+__pycache__/
+outputs/
+data/

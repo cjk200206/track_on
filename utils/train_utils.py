@@ -167,7 +167,7 @@ def _extract_state_dict(obj) -> dict:
         return obj
     return obj
 
-def load_pretrained_weights(model, checkpoint_path):
+def load_pretrained_weights(model, checkpoint_path, extra_allowed_missing_prefixes=()):
     raw = torch.load(checkpoint_path, map_location="cpu")
     state_dict = _strip_module_prefix(_extract_state_dict(raw))
 
@@ -179,20 +179,22 @@ def load_pretrained_weights(model, checkpoint_path):
     if unexpected:
         raise RuntimeError(f"Unexpected keys in checkpoint (not present in model): {unexpected}")
 
+    allowed_missing_prefixes = ALLOWED_MISSING_PREFIXES + tuple(extra_allowed_missing_prefixes)
     disallowed_missing = [
         k for k in missing
-        if not any(k.startswith(pfx) for pfx in ALLOWED_MISSING_PREFIXES)
+        if not any(k.startswith(pfx) for pfx in allowed_missing_prefixes)
     ]
 
     if disallowed_missing:
         raise RuntimeError(
             "Checkpoint is missing parameters outside the allowed encoders.\n"
             f"Disallowed missing keys:\n  {disallowed_missing}\n"
-            f"(Allowed missing prefixes: {ALLOWED_MISSING_PREFIXES})")
+            f"(Allowed missing prefixes: {allowed_missing_prefixes})")
 
     print(f"Loaded model weights from {checkpoint_path}")
     if missing:
-        print(f"Info: missing (allowed) weights: {len(missing)} keys under {set(p.split('.')[0] + '.' + p.split('.')[1] + '.' + p.split('.')[2] for p in missing)}")
+        prefixes = {".".join(key.split(".")[:3]) for key in missing}
+        print(f"Info: missing (allowed) weights: {len(missing)} keys under {prefixes}")
 
 
 

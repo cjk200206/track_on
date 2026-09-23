@@ -19,7 +19,8 @@ from model.vit_adapter.dinov3_adapter.dinov3_adapter_modules import (
 class ViTAdapter(nn.Module):
     def __init__(self, conv_inplane=64, n_points=4,
                  deform_num_heads=6, init_values=0., interaction_indexes=[[0, 2], [3, 5], [6, 8], [9, 11]], with_cffn=True,
-                 cffn_ratio=0.25, deform_ratio=1.0, use_extra_extractor=True, with_cp=False, vit_upsample_factor=1.0, arch_type="s"):
+                 cffn_ratio=0.25, deform_ratio=1.0, use_extra_extractor=True, with_cp=False, vit_upsample_factor=1.0,
+                 arch_type="s", pretrained_model_path=None):
         super().__init__()
 
         if arch_type == "s":
@@ -31,10 +32,17 @@ class ViTAdapter(nn.Module):
         else:
             raise ValueError(f"Unknown arch_type: {arch_type}")
 
+        if pretrained_model_path is not None:
+            pretrained_model_name = pretrained_model_path
+
         # NOTE: If you are working in an environment without internet access, 
         #       make sure to download the pretrained DINOv3 weights to cache (eg with a call on login node)
         #       and set `local_files_only=True` in the line below for your trainings.
-        self.dinov3 = AutoModel.from_pretrained(pretrained_model_name, device_map=None, local_files_only=False)
+        self.dinov3 = AutoModel.from_pretrained(
+            pretrained_model_name,
+            device_map=None,
+            local_files_only=pretrained_model_path is not None,
+        )
         self.patch_size = 16
 
         # Freeze vit

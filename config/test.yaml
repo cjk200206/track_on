@@ -6,6 +6,7 @@ decoder_layer_num: 3
 predicton_head_layer_num: 3
 rerank_layer_num: 3
 vit_backbone: "dinov3_s_plus"
+vit_pretrained_path: "checkpoints/dinov3_hf/vits16plus_lvd1689m"
 vit_upsample_factor: 1.143
 M_i: 72
 delta_v: 0.8

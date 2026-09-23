@@ -112,7 +112,7 @@ class Track_On2(nn.Module):
         return c
     
     # Multiscale ViT-Adapter
-    def forward(self, video, queries, p_mask=0.1):
+    def forward(self, video, queries, p_mask=0.1, events=None):
         # :args video: (B, T, 3, H_in, W_in) in range [0, 255]
         # :args gt_tracks: (B, T, N, 2) in range [0, H_in] and [0, W_in]
         # :args queries: (B, N, 3) where 3 is (t, x, y) in range [0, 255]
@@ -132,10 +132,18 @@ class Track_On2(nn.Module):
         video = video.view(B * T, 3, H_in, W_in) / 255.0                        # (B * T, 3, H, W), to [0, 1]
         video = F.interpolate(video, size=self.input_size, mode="bilinear", align_corners=False)
         video = video.view(B, T, 3, self.H, self.W)                             # (B, T, 3, H, W)
+        if events is not None:
+            if events.shape[:2] != (B, T) or events.shape[-2:] != (H_in, W_in):
+                raise ValueError("events must match the video batch, time, height, and width")
+            event_channels = events.shape[2]
+            events = F.interpolate(
+                events.reshape(B * T, event_channels, H_in, W_in),
+                size=self.input_size, mode="bilinear", align_corners=False,
+            ).reshape(B, T, event_channels, self.H, self.W)
         # === === ===
 
         # == Feature Projection ==
-        f4, f8, f16, f32 = self.backbone(video)                           # (B, T, P, D), (B, T, P // 4, D), (B, T, P // 16, D), (B, T, P // 64, D)
+        f4, f8, f16, f32 = self.backbone(video, events=events)           # (B, T, P, D), (B, T, P // 4, D), (B, T, P // 16, D), (B, T, P // 64, D)
         f_fused = self.fpn(f4, f8, f16, f32)                              # (B, T, P, D)
         # === === ===
 
