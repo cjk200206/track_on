@@ -50,7 +50,8 @@ class Loss_Tracker:
         self.losses["L_topk_rank"] += L_topk_rank   
         self.temporal_count += 1
 
-    def log(self):
+    def log(self, learning_rate=None, skipped_microbatches=0, microbatches=1,
+            optimizer_updated=True, grad_norm=None):
         if self.rank != 0:
             return
         
@@ -73,10 +74,38 @@ class Loss_Tracker:
                     f"Training/uncertainty_loss": L_u,
                     f"Training/topk_uncertainty_loss": L_topk_u,
                     f"Training/topk_rank_loss": L_topk_rank,
-                    "Training/batch_loss": L_p + L_p + L_vis + L_o + L_u + L_topk_u + L_topk_rank}, commit=False)
-        wandb.log({"iteration": self.iteration}, commit=True)
+                    "Training/batch_loss": L_p + L_p_rerank + L_vis + L_o + L_u + L_topk_u + L_topk_rank}, commit=False)
+        if learning_rate is not None:
+            wandb.log({"Training/lr": learning_rate}, commit=False)
+        metrics = {
+            "Training/skipped_batch": int(skipped_microbatches > 0),
+            "Training/skipped_microbatches": skipped_microbatches,
+            "Training/accumulated_microbatches": microbatches,
+            "Training/optimizer_updated": int(optimizer_updated),
+            "iteration": self.iteration,
+        }
+        if grad_norm is not None:
+            metrics["Training/grad_norm_before_clip"] = float(grad_norm)
+        wandb.log(metrics, commit=True)
 
         self.iteration += 1
+
+    def skip(self, learning_rate=None, count=1):
+        if self.rank != 0:
+            return
+        metrics = {
+            "Training/skipped_batch": 1,
+            "Training/skipped_microbatches": count,
+            "Training/accumulated_microbatches": 0,
+            "Training/optimizer_updated": 0,
+            "iteration": self.iteration,
+        }
+        if learning_rate is not None:
+            metrics["Training/lr"] = learning_rate
+        wandb.log(metrics, commit=True)
+        self.iteration += 1
+        self.losses = {key: 0 for key in self.losses}
+        self.temporal_count = 0
 
 
 def init_wandb(args):
@@ -106,6 +135,11 @@ def init_wandb(args):
 
         wandb.define_metric("iteration")
         wandb.define_metric("Training/batch_loss", step_metric="iteration")
+        wandb.define_metric("Training/skipped_batch", step_metric="iteration")
+        wandb.define_metric("Training/skipped_microbatches", step_metric="iteration")
+        wandb.define_metric("Training/accumulated_microbatches", step_metric="iteration")
+        wandb.define_metric("Training/optimizer_updated", step_metric="iteration")
+        wandb.define_metric("Training/grad_norm_before_clip", step_metric="iteration")
         wandb.define_metric("Training/point_loss", step_metric="iteration")
         wandb.define_metric("Training/point_rerank_loss", step_metric="iteration")
         wandb.define_metric("Training/visibility_loss", step_metric="iteration")

@@ -263,6 +263,51 @@ torchrun --master_port=12345 --nproc_per_node=#gpus main.py \
 --config_path config/train.yaml
 ```
 
+### Frame + Event Kubric feasibility experiment
+
+The paired frame/event experiment uses `config/train_frame_event.yaml` and trains only the event fusion module. Check the data and run the single-card overfit diagnostic before the distributed run:
+
+```bash
+conda activate track_on_r
+python main_frame_event.py --check-data
+python main_frame_event.py --overfit-one-batch --output-dir outputs/frame_event_smoke
+```
+
+Run a short four-GPU smoke test, then the configured 1000-step experiment:
+
+```bash
+python main_frame_event.py --gpus 0 1 2 3 \
+  --max-steps 2 --skip-eval --output-dir outputs/frame_event_smoke
+python main_frame_event.py --gpus 0 1 2 3
+```
+
+`--gpus` takes the GPU IDs reported by `nvidia-smi`; for example, `--gpus 1 3` trains on GPUs 1 and 3, while `--gpus 2` uses one GPU. The existing `torchrun --nproc-per-node=4 main_frame_event.py` entry point remains available.
+
+Each GPU processes one clip per optimizer step, so four GPUs give an effective batch size of four. The step count is unchanged. Each launch creates a local-time folder such as `outputs/frame_event/20260924_150206/`. Rank 0 saves `run_config.json`, periodic `train_metrics.jsonl`, `frame_event_last.pt`, and the RGB-only/fused/zero-event `metrics.json` there. Use `--skip-eval` only when checking the training launch. Training logs show `loss_avg` (the mean over all GPUs and all completed steps) and `loss_recent` (the mean over all GPUs and the latest `log_every` steps). `components_recent` contains the loss terms over that same recent window. These values are also saved in `train_metrics.jsonl`; the JSONL file additionally includes `components_avg`.
+
+To compare against the 1:4 frame/event run using a new RGB frame at every event step, use `config/train_frame_event_full_frames.yaml`. It keeps the same model, event maps, sequence subsets, optimizer, and 1000-step schedule, but sets `frame_interval: 1` and creates a timestamped run folder under `outputs/frame_event_full_frames`:
+
+```bash
+python main_frame_event.py --config config/train_frame_event_full_frames.yaml --check-data
+python main_frame_event.py --config config/train_frame_event_full_frames.yaml \
+  --gpus 0 1 2 3
+```
+
+Compare RGB-only, fused, and zero-event metrics within each run. Because the RGB inputs differ between the two configs, compare the event gain over that run's own RGB-only baseline.
+
+### Visualizing frame + event Kubric predictions
+
+Render a 24-step clip from `data/event_kubric/test` with the same first-visible GT queries used by validation. Use the config that matches the checkpoint's frame interval:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python visualize_frame_event_kubric.py \
+  --config config/train_frame_event_full_frames.yaml \
+  --checkpoint outputs/frame_event_full_frames/frame_event_last.pt \
+  --sequence 00000000
+```
+
+For a newer timestamped run, point `--checkpoint` to that run directory. The script writes `<checkpoint_dir>/visualizations/00000000_comparison.mp4`, a midpoint PNG preview, and a JSON summary. The video shows GT, RGB-only, RGB+event, and zero-event tracks on the same clip, plus the event time surface. Display defaults to clear RGB, while inference uses the blurred RGB stored by the dataset; use `--no-display-clear` to show the exact model input. Use `--clip-start 24` for a later 24-step clip, `--num-sequences 5` for the first five test sequences, or `--query-mode grid --grid-size 8` for a grid-query view. For a 1:4 checkpoint, pass `config/train_frame_event.yaml` instead.
+
 ### Verifier Training
 
 During verifier training, we optionally evaluate the model after each epoch using predictions from a set of baseline trackers.

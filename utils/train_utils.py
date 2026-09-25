@@ -16,6 +16,9 @@ import yaml
 from argparse import Namespace
 
 from dataset.movi_f import Movi_F_Large
+from dataset.event_kubric_rgb import (
+    EventKubricTrain, EventKubricVal, WeightedDistributedSampler, build_sources,
+)
 from dataset.tapvid import TAPVid
 from dataset.real_world_dataset import Real_World_Dataset
 from dataset.epic_k import EpicK
@@ -38,7 +41,12 @@ def get_dataloaders(args, train_set="kubric"):
         np.random.seed(worker_seed)
         random.seed(worker_seed)
 
-    if train_set == "kubric":
+    event_kubric_rgb = getattr(args, "train_dataset", None) == "event_kubric_rgb"
+    if event_kubric_rgb:
+        train_paths, val_paths, group_ids, group_weights = build_sources(args)
+        train_dataset = EventKubricTrain(args, train_paths)
+        val_dataset = EventKubricVal(args, val_paths)
+    elif train_set == "kubric":
         train_dataset = Movi_F_Large(args)
     elif train_set == "epic_k":
         train_dataset = EpicK(args.epic_k_path, T=24, N=args.N, enable_aug=True)
@@ -59,14 +67,21 @@ def get_dataloaders(args, train_set="kubric"):
             train_dataset = SynRealDataset(real_dataset, syn_dataset=None)
             print(f"Real-only training: {len(real_dataset)} samples")
 
-    val_dataset = TAPVid(args)
+    if not event_kubric_rgb:
+        val_dataset = TAPVid(args)
 
     # (#cpus * #gpus) in a node:
-    num_workers = 8 * 4                     
-    train_sampler = torch.utils.data.DistributedSampler(train_dataset, 
-                                                        rank=args.rank, 
-                                                        shuffle=True, 
-                                                        seed=args.seed)
+    num_workers = int(getattr(args, "num_workers", 8 * 4))
+    if event_kubric_rgb:
+        train_sampler = WeightedDistributedSampler(
+            group_ids, group_weights, args.samples_per_epoch,
+            args.rank, args.world_size, args.seed,
+        )
+    else:
+        train_sampler = torch.utils.data.DistributedSampler(train_dataset,
+                                                            rank=args.rank,
+                                                            shuffle=True,
+                                                            seed=args.seed)
 
     g = torch.Generator()
     g.manual_seed(args.seed)
@@ -80,14 +95,14 @@ def get_dataloaders(args, train_set="kubric"):
         generator=g,
         drop_last=True,
         pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=2,
+        persistent_workers=num_workers > 0,
+        **({"prefetch_factor": 2} if num_workers > 0 else {}),
     )
 
     val_dataloader = torch.utils.data.DataLoader(val_dataset,
         batch_size=1,
         shuffle=False,
-        num_workers=8,
+        num_workers=int(getattr(args, "val_num_workers", 8)),
         drop_last=False,
         pin_memory=False)
 
@@ -95,19 +110,25 @@ def get_dataloaders(args, train_set="kubric"):
 
 
 def get_scheduler(args, optimizer, train_loader, constant=False, warmup=False):
+    updates_per_epoch = math.ceil(len(train_loader) / int(getattr(args, "grad_accum_steps", 1)))
     if constant:
         scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=args.epoch_num)
 
     elif warmup:
-        T_max = (len(train_loader)) * args.epoch_num
-        warmup_steps = int(T_max * 0.01)
+        T_max = updates_per_epoch * args.epoch_num
+        warmup_ratio = float(getattr(args, "warmup_ratio", 0.01))
+        if not 0 < warmup_ratio < 1:
+            raise ValueError("warmup_ratio must be between 0 and 1 when warmup is enabled")
+        warmup_steps = max(1, int(T_max * warmup_ratio))
         steps = T_max - warmup_steps
+        if steps < 1:
+            raise ValueError("Training must have at least one step after warmup")
 
         linear_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-5, total_iters=warmup_steps)
         cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
         scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[linear_scheduler, cosine_scheduler], milestones=[warmup_steps])
     else:
-        T_max = (len(train_loader)) * args.epoch_num
+        T_max = updates_per_epoch * args.epoch_num
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=T_max)
 
     return scheduler
@@ -145,6 +166,9 @@ def restart_from_checkpoint(remove_module, checkpoint_path, run_variables, **kwa
             if var_name in checkpoint:
                 run_variables[var_name] = checkpoint[var_name]
                 
+
+    return checkpoint.get("scheduler", {})
+
 
 # === Loading pretrained Track-On2 checkpoint ===
 

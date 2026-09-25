@@ -1,0 +1,35 @@
+# Full-frame RGB + event control: one new RGB image per event step.
+train_root: data/event_kubric/train
+val_root: data/event_kubric/val
+checkpoint_path: checkpoints/trackon2_dinov3_checkpoint.pt
+output_dir: outputs/frame_event_full_frames
+
+input_size: [384, 512]
+T: 24
+N: 128
+train_sequences: 512
+val_sequences: 64
+frame_interval: 1
+num_workers: 2
+
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+grad_checkpoint: false
+event_channels: 10
+
+lambda_patch_cls: 3.0
+delta_v: 0.8
+max_steps: 1000
+overfit_steps: 100
+log_every: 100
+lr: 0.0005
+wd: 0.00001
+amp: true  # FP16 autocast; frozen RGB model needs no gradient scaler
+seed: 1234

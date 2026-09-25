@@ -1,0 +1,67 @@
+# Extended run: panning remains 40%; every training-type supplement has a 90/10 split.
+# Exposure sources total 3% and are read from sharp RGB, avoiding extreme blur/exposure renders.
+# Test-only groups (sup_orbit_test, sup_scale_test, object_fast_validation) are excluded.
+event_kubric_sources:
+  - {name: train, weight: 47, val_fraction: 0.0}
+  - {name: sup_panning, weight: 40, val_fraction: 0.1}
+  - {name: sup_fast, weight: 2, val_fraction: 0.1}
+  - {name: sup_fast_panning, weight: 2, val_fraction: 0.1}
+  - {name: object_fast, weight: 2, val_fraction: 0.1}
+  - {name: scale_medium_linear, weight: 1, val_fraction: 0.1}
+  - {name: scale_far_linear, weight: 1, val_fraction: 0.1}
+  - {name: scale_medium_panning, weight: 1, val_fraction: 0.1}
+  - {name: scale_far_panning, weight: 1, val_fraction: 0.1}
+  - {name: sup_exposure, weight: 1, val_fraction: 0.1}
+  - {name: sup_panning_exposure, weight: 1, val_fraction: 0.1}
+  - {name: sup_fast_panning_exposure, weight: 1, val_fraction: 0.1}
+
+# RGB-only Track-On2 pretraining on existing ETAP/TAPFormer EventKubric data.
+# One epoch draws 9,000 sequences globally; on four GPUs this is 2,250 optimizer steps.
+train_dataset: event_kubric_rgb
+logging_backend: tensorboard  # Set to wandb to use the original online logger.
+eval_dataset: kubric
+movi_f_root: data/event_kubric/train  # Used by the shared Movi-F augmentation base.
+event_kubric_root: data/event_kubric
+event_kubric_val_root: data/event_kubric/val
+split_seed: 1234
+event_kubric_rgb_variant: sharp  # raw/rgba_*.png, never rgba_blur_*.png
+event_kubric_base_val_limit: 32
+event_kubric_val_per_source: 8
+event_kubric_eval_points: 128
+samples_per_epoch: 9000
+num_workers: 4  # Per GPU; the original fixed 32 workers per GPU is excessive here.
+val_num_workers: 2
+eval_every_epochs: 10
+best_metric: aj  # best.pt follows Kubric validation AJ.
+save_every: 10  # Save epoch_XXXX.pt every 10 epochs; last.pt is saved every epoch.
+
+checkpoint_path: null  # Randomly initialize the tracker; frozen DINOv3 remains pretrained.
+model_save_path: "outputs/trackon2_kubric_all"
+
+frame_sampling: uniform
+frame_sample_ratio: 2.0
+input_size: [384, 512]
+# 24-GB RTX 3090: one complete forward/backward/AdamW step peaked at 19.14 GiB.
+# Author settings N=384, T=48 remain in config/train.yaml and OOM here.
+N: 192
+T: 24
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+M_i: 72
+delta_v: 0.8
+lambda_patch_cls: 3.0
+evaluation: true
+epoch_num: 200
+lr: 0.0005
+wd: 0.00001
+bs: 1
+grad_checkpoint: true
+amp: true
+seed: 1234

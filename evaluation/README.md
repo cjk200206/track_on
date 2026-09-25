@@ -91,3 +91,76 @@ torchrun --master_port=12345 --nproc_per_node=1 -m evaluation.eval \
 --verifier_checkpoint_path /path/to/verifier/ckpt
 ```
 
+
+## TAPFormer real datasets with the original RGB Track-On2
+
+The separate `test_tapformer_real` entry point evaluates Track-On2 on **InivTAP** and
+**DrivTAP** from TAPFormer's `TAPFormer_Dataset`. Configure dataset location,
+checkpoint, model config, sequence list, support grid, and output path in
+[`config/test_tapformer_real.yaml`](../config/test_tapformer_real.yaml). Relative
+paths in the YAML are resolved from the Track-On2 repository root.
+
+```bash
+conda activate track_on_r
+python -m evaluation.test_tapformer_real --config config/test_tapformer_real.yaml
+# Quick check of one configured sequence:
+python -m evaluation.test_tapformer_real --config config/test_tapformer_real.yaml --sequence ID_Fast_Fruit
+```
+
+The evaluator streams the original RGB images through Track-On2 and computes the
+repository's TAP-Vid AJ, delta average, and OA metrics. InivTAP annotations
+match the image frames. For DrivTAP sequences with twice as many GT samples as
+images, `drivtap_gt_mode: downsample_even` selects GT indices `0, 2, ...`, as
+in TAPFormer's configuration. Each dataset's result is the unweighted mean of
+its sequence metrics. Results are written to `output_dir/summary.json`; set
+`save_predictions: true` to also save per-sequence NPZ predictions.
+
+This RGB evaluation follows the image frame rate. TAPFormer's event-based run
+tracks intermediate event timestamps too, so scores from the two protocols are
+not directly comparable.
+
+### EDS and EC feature tracking
+
+The EDS/EC port uses the original RGB images and TAPFormer's sparse GT files.
+Configure it in [`config/test_tapformer_features.yaml`](../config/test_tapformer_features.yaml),
+then run:
+
+```bash
+python -m evaluation.test_tapformer_features --config config/test_tapformer_features.yaml
+```
+
+It reports TAPFormer's mean error, feature age (FA), and expected feature age
+(EFA), each averaged over the configured 1–31 pixel thresholds. Predictions are
+interpolated from RGB frame timestamps to GT timestamps for the metric.
+TAPFormer's event model can update between RGB frames, so its EDS/EC scores and
+these RGB scores use different inference timelines.
+
+Both TAPFormer entry points also write `summary.csv` next to `summary.json`.
+The CSV has one row per sequence and one `dataset_mean` row per dataset; it
+includes model/checkpoint identifiers and frame timing. InivTAP/DrivTAP metric
+columns end in `_pct` and contain percentage values (for example, `46.26`),
+while EDS/EC columns retain FA/EFA fractions and pixel error. Set
+`csv_filename` in the corresponding YAML to rename the CSV.
+
+### Video previews and VS Code playback
+
+Set `visualization.enabled: true` in the relevant YAML to save one video and
+middle-frame PNG per sequence under `output_dir/videos/`. InivTAP/DrivTAP videos
+show GT and Track-On2 predictions side by side; EDS/EC videos show predictions
+on the RGB frames. `visualization.format: mp4` writes H.264/yuv420p with
+`faststart`; set it to `webm` for VP8. Adjust `fps`, `trail_length`, and
+`max_width` in the same config. The JSON and CSV store the paths to each video
+and PNG preview. Video export requires the system `ffmpeg` executable with
+`libx264` (MP4) or `libvpx` (WebM).
+
+Older visualization files in this repository were written with OpenCV's `mp4v`
+codec. VS Code's built-in media preview uses a browser video element, which may
+show "unsupported format" for those MP4 files even though `ffprobe` can read
+them. Convert one without rerunning inference:
+
+```bash
+ffmpeg -i old.mp4 -an -c:v libx264 -pix_fmt yuv420p -movflags +faststart old_h264.mp4
+```
+
+If the client still cannot play H.264, use the VP8 WebM option or inspect the
+PNG preview.

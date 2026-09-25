@@ -21,6 +21,7 @@ class FrameEventKubric(Dataset):
         max_sequences=None,
         training=False,
         seed=1234,
+        eval_start=0,
     ):
         self.root = Path(root)
         self.clip_length = clip_length
@@ -29,10 +30,11 @@ class FrameEventKubric(Dataset):
         self.frame_interval = frame_interval
         self.training = training
         self.seed = seed
+        self.eval_start = eval_start
         if not self.root.is_dir():
             raise FileNotFoundError(self.root)
-        if clip_length < 2 or num_points < 1 or frame_interval < 1:
-            raise ValueError("clip_length must be >= 2, num_points and frame_interval must be positive")
+        if clip_length < 2 or num_points < 1 or frame_interval < 1 or eval_start < 0:
+            raise ValueError("clip_length must be >= 2, num_points and frame_interval positive, eval_start non-negative")
         self.sequences = sorted(p for p in self.root.iterdir() if p.is_dir())
         if max_sequences is not None:
             self.sequences = self.sequences[:max_sequences]
@@ -62,7 +64,9 @@ class FrameEventKubric(Dataset):
         if num_intervals < self.clip_length:
             raise ValueError(f"{sequence}: fewer than {self.clip_length} aligned event intervals")
 
-        start = np.random.randint(num_intervals - self.clip_length + 1) if self.training else 0
+        start = np.random.randint(num_intervals - self.clip_length + 1) if self.training else self.eval_start
+        if start + self.clip_length > num_intervals:
+            raise ValueError(f"{sequence}: clip {start}:{start + self.clip_length} exceeds {num_intervals} intervals")
         interval_indices = np.arange(start, start + self.clip_length)
         annotation_indices = interval_indices + 1
 

@@ -1,0 +1,32 @@
+# EDS/EC evaluation with the original RGB Track-On2. Paths are relative to this repo.
+dataset_root: ../TAPFormer/data/TAPFormer_Dataset
+model_config: config/test.yaml
+checkpoint: checkpoints/trackon2_dinov3_checkpoint.pt
+output_dir: outputs/features_tapformer_trackon2
+csv_filename: summary.csv
+
+sequences:
+  EDS:
+    - peanuts_light_160_386
+    - rocket_earth_light_338_438
+    - ziggy_in_the_arena_1350_1650
+    - peanuts_running_2360_2460
+  EC:
+    - shapes_translation_8_88
+    - shapes_rotation_165_245
+    - shapes_6dof_485_565
+    - boxes_translation_330_410
+    - boxes_rotation_198_278
+
+feature_thresholds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]
+support_grid_size: 20
+device: auto
+amp: true
+save_predictions: false
+
+visualization:
+  enabled: false       # Enable when running the EDS/EC benchmark
+  format: mp4          # H.264; webm uses VP8
+  fps: 10
+  trail_length: 8
+  max_width: 960
