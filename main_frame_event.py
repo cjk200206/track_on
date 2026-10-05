@@ -1,11 +1,13 @@
-"""Feasibility experiment for paired Kubric frames and time surfaces.
+"""Train Track-On2 on paired Kubric frames and event time surfaces.
 
-Run --check-data first, then --overfit-one-batch, then the default training run.
-Use --gpus 0 1 2 3 to select GPU IDs, or launch with torchrun.
+Use --check-data to inspect alignment and --max-steps for a short training check.
+Use --gpus to select GPU IDs, or launch with torchrun.
+Use --resume PATH to continue from a full-training checkpoint.
 Use --eval-checkpoint PATH to repeat the three validation modes.
 """
 
 import argparse
+from contextlib import nullcontext
 import json
 import os
 import subprocess
@@ -20,12 +22,13 @@ from PIL import Image, ImageDraw
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 
+from dataset.event_kubric_rgb import WeightedDistributedSampler, build_sources
 from dataset.frame_event_kubric import FrameEventKubric
 from model.loss import Loss_Function
 from model.trackon import Track_On2
 from utils.coord_utils import get_queries
 from utils.eval_utils import compute_tapvid_metrics
-from utils.train_utils import load_args_from_yaml, load_pretrained_weights
+from utils.train_utils import get_scheduler, load_args_from_yaml, load_pretrained_weights
 
 
 def create_run_directory(base_dir):
@@ -63,28 +66,41 @@ def first_visible_queries(tracks, visibility):
 
 
 def make_loader(args, training, rank=0, world_size=1):
+    mixed_sources = hasattr(args, "event_kubric_sources")
+    if mixed_sources:
+        train_paths, val_paths, group_ids, group_weights = build_sources(args)
+        paths = train_paths if training else val_paths
+    else:
+        paths = None
     dataset = FrameEventKubric(
-        root=args.train_root if training else args.val_root,
+        root=args.event_kubric_root if mixed_sources else (args.train_root if training else args.val_root),
         clip_length=args.T,
-        num_points=args.N,
+        num_points=args.N if training else getattr(args, "val_points", args.N),
         crop_size=args.input_size,
         frame_interval=args.frame_interval,
-        max_sequences=args.train_sequences if training else args.val_sequences,
+        max_sequences=None if mixed_sources else (args.train_sequences if training else args.val_sequences),
         training=training,
         seed=args.seed,
+        sequence_paths=paths,
+        anchor_aligned=getattr(args, "event_fusion_type", "simple") != "simple",
     )
-    sampler = (
-        DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
-        if training and world_size > 1 else None
-    )
+    if training and mixed_sources:
+        sampler = WeightedDistributedSampler(
+            group_ids, group_weights, args.samples_per_epoch, rank, world_size, args.seed
+        )
+    elif training and world_size > 1:
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
+    else:
+        sampler = None
+    workers = args.num_workers if training else getattr(args, "val_num_workers", args.num_workers)
     return DataLoader(
         dataset,
-        batch_size=1,
+        batch_size=getattr(args, "bs", 1),
         shuffle=training and sampler is None,
         sampler=sampler,
-        num_workers=args.num_workers,
+        num_workers=workers,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
+        persistent_workers=workers > 0,
         generator=torch.Generator().manual_seed(args.seed),
     )
 
@@ -121,20 +137,24 @@ def move_batch(batch, device):
 
 def build_model(args, device):
     model = Track_On2(args).to(device)
-    load_pretrained_weights(
-        model,
-        args.checkpoint_path,
-        extra_allowed_missing_prefixes=("backbone.event_fusion.",),
-    )
-    for name, parameter in model.named_parameters():
-        parameter.requires_grad_(name.startswith("backbone.event_fusion."))
-    model.eval()  # Keep the pretrained BatchNorm statistics fixed during event training.
+    if args.checkpoint_path is not None:
+        load_pretrained_weights(
+            model,
+            args.checkpoint_path,
+            extra_allowed_missing_prefixes=("backbone.event_fusion.",),
+        )
+    if getattr(args, "train_event_only", True):
+        for name, parameter in model.named_parameters():
+            parameter.requires_grad_(name.startswith("backbone.event_fusion."))
+        model.eval()  # Keep the pretrained BatchNorm statistics fixed during event training.
+    else:
+        model.train()
     if int(os.environ.get("RANK", "0")) == 0:
         dino_path = getattr(args, "vit_pretrained_path", None)
         if dino_path is not None:
             print(f"DINOv3 initialized from {dino_path} and frozen", flush=True)
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Trainable event-fusion parameters: {trainable}", flush=True)
+        print(f"Trainable parameters: {trainable}", flush=True)
     return model
 
 
@@ -167,7 +187,7 @@ def evaluate(model, loader, args, device, event_mode):
         else:
             events = batch["events"]
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
-            output = model(batch["video"], queries.clone(), p_mask=0, events=events)
+            output = model(batch["video"], queries.clone(), p_mask=0, events=events, img_ifnew=batch["img_ifnew"])
         predicted = output["P"]
         predicted_visible = output["V_logit"].sigmoid() >= args.delta_v
         metric = compute_tapvid_metrics(
@@ -229,7 +249,8 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
             queries = fixed_queries
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
-            output = model(batch["video"], queries.clone(), events=batch["events"], p_mask=0 if overfit_one_batch else 0.1)
+            output = model(batch["video"], queries.clone(), events=batch["events"],
+                           img_ifnew=batch["img_ifnew"], p_mask=0 if overfit_one_batch else 0.1)
             losses = loss_fn(output, batch["tracks"], batch["visibility"], queries[..., 0].long())
             loss = sum(losses)
         if not torch.isfinite(loss):
@@ -274,6 +295,153 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
             window_steps = 0
 
 
+def train_full(model, loader, val_loader, args, device, rank, max_steps=None, skip_eval=False, resume_path=None):
+    accumulation = args.grad_accum_steps
+    if accumulation < 1:
+        raise ValueError("grad_accum_steps must be positive")
+    optimizer = torch.optim.AdamW(
+        (p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.wd
+    )
+    scheduler = get_scheduler(args, optimizer, loader, warmup=True)
+    scaler = torch.GradScaler(enabled=args.amp)
+    loss_fn = Loss_Function(args)
+    raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    updates_per_epoch = (len(loader) + accumulation - 1) // accumulation
+    if rank == 0:
+        print(
+            f"Effective batch: {args.bs * world_size * accumulation}; "
+            f"up to {updates_per_epoch * args.epoch_num} optimizer updates",
+            flush=True,
+        )
+
+    names = ("loss", "patch1", "patch2", "visibility", "offset", "uncertainty", "topk_uncertainty", "ranking")
+    start_epoch = 0
+    total_steps = 0
+    best_aj = -1.0
+    if resume_path is not None:
+        checkpoint = torch.load(resume_path, map_location="cpu", weights_only=False)
+        raw_model.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["scheduler"])
+        scaler.load_state_dict(checkpoint["scaler"])
+        start_epoch = int(checkpoint["epoch"])
+        total_steps = int(checkpoint["step"])
+        best_aj = float(checkpoint["best_aj"])
+        if rank == 0:
+            print(f"Resumed from {resume_path}: epoch={start_epoch}, step={total_steps}, "
+                  f"best AJ={best_aj:.4f}, AMP scale={scaler.get_scale():g}", flush=True)
+    output_dir = Path(args.output_dir)
+    for epoch in range(start_epoch, args.epoch_num):
+        if hasattr(loader.sampler, "set_epoch"):
+            loader.sampler.set_epoch(epoch)
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        remaining = None if max_steps is None else max_steps - total_steps
+        if remaining is not None and remaining <= 0:
+            break
+        batch_limit = len(loader) if remaining is None else min(len(loader), remaining * accumulation)
+        recent = torch.zeros(len(names), device=device)
+        recent_batches = 0
+
+        for batch_index, raw_batch in enumerate(loader):
+            if batch_index >= batch_limit:
+                break
+            batch = move_batch(raw_batch, device)
+            queries = get_queries(batch["tracks"], batch["visibility"])
+            window_start = (batch_index // accumulation) * accumulation
+            window_size = min(accumulation, batch_limit - window_start)
+            update_now = batch_index - window_start + 1 == window_size
+            sync = model.no_sync() if isinstance(model, DistributedDataParallel) and not update_now else nullcontext()
+            with sync:
+                with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=args.amp):
+                    prediction = model(batch["video"], queries.clone(), events=batch["events"], img_ifnew=batch["img_ifnew"])
+                    losses = loss_fn(prediction, batch["tracks"], batch["visibility"], queries[..., 0].long())
+                    loss = sum(losses)
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"Non-finite loss at epoch {epoch + 1}, batch {batch_index + 1}")
+                scaler.scale(loss / window_size).backward()
+            recent += torch.stack((loss.detach().float(), *(part.detach().float() for part in losses)))
+            recent_batches += 1
+
+            if update_now:
+                scaler.unscale_(optimizer)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(
+                    (p for p in model.parameters() if p.requires_grad), max_norm=1.0
+                )
+                if not args.amp and not torch.isfinite(gradient_norm):
+                    raise RuntimeError(f"Non-finite gradient at epoch {epoch + 1}, batch {batch_index + 1}")
+                previous_scale = scaler.get_scale()
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer_updated = scaler.get_scale() >= previous_scale
+                if optimizer_updated:
+                    scheduler.step()
+                elif rank == 0:
+                    print(
+                        f"AMP skipped update at epoch {epoch + 1}, batch {batch_index + 1}; "
+                        f"scale {previous_scale:g} -> {scaler.get_scale():g}", flush=True
+                    )
+                optimizer.zero_grad(set_to_none=True)
+                total_steps += 1
+                if total_steps % args.log_every == 0 or batch_index + 1 == batch_limit:
+                    if dist.is_initialized():
+                        dist.all_reduce(recent, op=dist.ReduceOp.SUM)
+                    means = (recent / (recent_batches * world_size)).tolist()
+                    if rank == 0:
+                        record = {
+                            "epoch": epoch + 1, "step": total_steps,
+                            "loss_recent": means[0],
+                            "components_recent": dict(zip(names[1:], means[1:])),
+                            "lr": optimizer.param_groups[0]["lr"],
+                        }
+                        with (output_dir / "train_metrics.jsonl").open("a") as handle:
+                            handle.write(json.dumps(record) + "\n")
+                        print(
+                            f"epoch={epoch + 1}/{args.epoch_num} step={total_steps} "
+                            f"loss={means[0]:.5f} lr={record['lr']:.8g}", flush=True
+                        )
+                    recent.zero_()
+                    recent_batches = 0
+
+        if rank == 0:
+            raw_model.eval()
+            score = None
+            if not skip_eval:
+                score = evaluate(raw_model, val_loader, args, device, "fused")
+                with (output_dir / "eval_history.jsonl").open("a") as handle:
+                    handle.write(json.dumps({"epoch": epoch + 1, "step": total_steps, **score}) + "\n")
+            improved = score is not None and score["AJ"] > best_aj
+            if improved:
+                best_aj = score["AJ"]
+            state = {
+                "model": raw_model.state_dict(), "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
+                "epoch": epoch + 1, "step": total_steps, "best_aj": best_aj,
+            }
+            paths = [output_dir / "last.pt"]
+            if improved:
+                paths.append(output_dir / "best.pt")
+            if args.save_every and (epoch + 1) % args.save_every == 0:
+                paths.append(output_dir / f"epoch_{epoch + 1:04d}.pt")
+            for path in paths:
+                temporary = path.with_suffix(path.suffix + ".tmp")
+                torch.save(state, temporary)
+                os.replace(temporary, path)
+            print(f"checkpoint: {paths[0]}", flush=True)
+        if dist.is_initialized():
+            dist.barrier()
+        if max_steps is not None and total_steps >= max_steps:
+            break
+
+    if rank == 0 and not skip_eval:
+        load_event_checkpoint(raw_model, output_dir / "best.pt", device)
+        results = {mode: evaluate(raw_model, val_loader, args, device, mode)
+                   for mode in ("rgb", "fused", "zero")}
+        with (output_dir / "metrics.json").open("w") as handle:
+            json.dump(results, handle, indent=2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/train_frame_event.yaml")
@@ -283,11 +451,24 @@ def main():
     parser.add_argument("--gpus", nargs="+", type=int, metavar="ID", help="GPU IDs to use, e.g. --gpus 0 1 2 3")
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--output-dir", type=str)
+    parser.add_argument("--resume", type=str, help="Full-training checkpoint to resume in its original run directory")
     parser.add_argument("--eval-checkpoint", type=str)
     cli = parser.parse_args()
+    if cli.resume:
+        if cli.check_data or cli.overfit_one_batch or cli.eval_checkpoint or cli.output_dir:
+            parser.error("--resume cannot be combined with --check-data, --overfit-one-batch, "
+                         "--eval-checkpoint, or --output-dir")
+        resume_path = Path(cli.resume).resolve()
+        if not resume_path.is_file():
+            parser.error(f"resume checkpoint does not exist: {resume_path}")
+        cli.resume = str(resume_path)
     args = load_args_from_yaml(cli.config)
     if cli.output_dir:
         args.output_dir = cli.output_dir
+    if cli.resume:
+        if not hasattr(args, "epoch_num"):
+            parser.error("--resume requires a full-training config with epoch_num")
+        args.output_dir = str(Path(cli.resume).parent)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -341,11 +522,13 @@ def main():
     device = torch.device("cuda", local_rank if world_size > 1 else 0)
     if cli.eval_checkpoint and rank != 0:
         return
-    args.output_dir = str(create_run_directory(args.output_dir))
+    if not cli.resume:
+        args.output_dir = str(create_run_directory(args.output_dir))
     if rank == 0:
         print(f"run directory: {args.output_dir}", flush=True)
-        with (Path(args.output_dir) / "run_config.json").open("w") as handle:
-            json.dump({"config_path": cli.config, "args": vars(args)}, handle, indent=2)
+        if not cli.resume:
+            with (Path(args.output_dir) / "run_config.json").open("w") as handle:
+                json.dump({"config_path": cli.config, "args": vars(args)}, handle, indent=2)
     model = build_model(args, device)
     if cli.eval_checkpoint:
         load_event_checkpoint(model, cli.eval_checkpoint, device)
@@ -353,6 +536,14 @@ def main():
         train_loader = make_loader(args, training=True, rank=rank, world_size=world_size)
         if world_size > 1:
             model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
+        if hasattr(args, "epoch_num") and not cli.overfit_one_batch:
+            val_loader = make_loader(args, training=False) if rank == 0 and not cli.skip_eval else None
+            train_full(model, train_loader, val_loader, args, device, rank,
+                       max_steps=cli.max_steps, skip_eval=cli.skip_eval, resume_path=cli.resume)
+            if dist.is_initialized():
+                dist.barrier()
+                dist.destroy_process_group()
+            return
         steps = cli.max_steps if cli.max_steps is not None else (
             args.overfit_steps if cli.overfit_one_batch else args.max_steps
         )

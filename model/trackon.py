@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 import torch
 
-from model.backbone import Backbone
+from model.event_backbone import EventBackbone, build_backbone
 from model.modules import MHA_Block, SimpleFPN
 from model.prediction_head import Prediction_Head
 from model.reranking import Rerank_Module
@@ -37,7 +37,7 @@ class Track_On2(nn.Module):
         # === === ===
 
         # === Modules ===
-        self.backbone = Backbone(args)
+        self.backbone = build_backbone(args)
         self.fpn = SimpleFPN(args)
         self.reranking_head = Rerank_Module(args, nhead)
         self.prediction_head = Prediction_Head(args, nhead)
@@ -56,6 +56,14 @@ class Track_On2(nn.Module):
         self.t_embedding = nn.Parameter(torch.zeros(1, self.M + 1, self.D))
         nn.init.trunc_normal_(self.t_embedding, std=0.02)
         # === === ===
+
+    def _backbone_features(self, video, events=None, img_ifnew=None, frontend_state=None):
+        """Keep event arguments out of the RGB backbone's interface."""
+        if isinstance(self.backbone, EventBackbone):
+            return self.backbone(video, events=events, img_ifnew=img_ifnew, frontend_state=frontend_state)
+        if events is not None:
+            raise ValueError("events were provided, but event_channels is not configured")
+        return self.backbone(video)
 
     def _make_transformer_layer(self, layer_num, nhead=4):
         layers = []
@@ -112,7 +120,7 @@ class Track_On2(nn.Module):
         return c
     
     # Multiscale ViT-Adapter
-    def forward(self, video, queries, p_mask=0.1, events=None):
+    def forward(self, video, queries, p_mask=0.1, events=None, img_ifnew=None):
         # :args video: (B, T, 3, H_in, W_in) in range [0, 255]
         # :args gt_tracks: (B, T, N, 2) in range [0, H_in] and [0, W_in]
         # :args queries: (B, N, 3) where 3 is (t, x, y) in range [0, 255]
@@ -143,7 +151,7 @@ class Track_On2(nn.Module):
         # === === ===
 
         # == Feature Projection ==
-        f4, f8, f16, f32 = self.backbone(video, events=events)           # (B, T, P, D), (B, T, P // 4, D), (B, T, P // 16, D), (B, T, P // 64, D)
+        f4, f8, f16, f32 = self._backbone_features(video, events=events, img_ifnew=img_ifnew)  # (B, T, P_s, D)
         f_fused = self.fpn(f4, f8, f16, f32)                              # (B, T, P, D)
         # === === ===
 
@@ -340,7 +348,7 @@ class Track_On2(nn.Module):
                 memory = point_memory[b, available_queries].clone()                # (N_t, M, D)
 
                 # === Visual Backbone Feedforward ===
-                f4_t, f8_t, f16_t, f32_t = self.backbone(video[b, t].unsqueeze(0).unsqueeze(0))     # (1, 1, P, D), (1, 1, P // 4, D), (1, 1, P // 16, D), (1, 1, P // 64, D)
+                f4_t, f8_t, f16_t, f32_t = self._backbone_features(video[b, t].unsqueeze(0).unsqueeze(0))     # (1, 1, P, D), (1, 1, P // 4, D), (1, 1, P // 16, D), (1, 1, P // 64, D)
                 f_fused_t = self.fpn(f4_t, f8_t, f16_t, f32_t)                                      # (1, 1, P, D)
                 
                 f4_t = f4_t.squeeze(0)                                                              # (1, P, D)
@@ -431,13 +439,21 @@ class Track_On2(nn.Module):
 
     # ==== Functions for Streaming inference below ==== #
     @torch.no_grad()
-    def extract_frame_features(self, frame):
+    def extract_frame_features(self, frame, events=None, img_ifnew=None, frontend_state=None):
         """
         Extract multi-scale features from a single frame.
         
         :args frame: Tensor of shape (1, 3, H_in, W_in) in range [0, 255]
+        :args events: Optional time surface of shape (1, C, H_in, W_in)
+        :args img_ifnew: New RGB arrival flag for motion fusion.
+        :args frontend_state: Caller-owned motion state for streaming inference.
         :return: Tuple of (f4_t, f8_t, f16_t, f32_t, f_fused_t) where all are (1, P_x, D)
         """
+        if events is not None:
+            if events.ndim != 4 or events.shape[0] != frame.shape[0] or events.shape[-2:] != frame.shape[-2:]:
+                raise ValueError("events must match the frame batch, height, and width")
+            events = F.interpolate(events, size=self.input_size, mode="bilinear", align_corners=False)
+            events = events.unsqueeze(1)
         # === Scaling ====
         frame = frame / 255.0                               # to [0, 1]
         frame = F.interpolate(frame, 
@@ -448,7 +464,10 @@ class Track_On2(nn.Module):
         # === === ===
         
         # === Visual Backbone Feedforward ===
-        f4_t, f8_t, f16_t, f32_t = self.backbone(frame)     # (1, 1, P, D), (1, 1, P // 4, D), (1, 1, P // 16, D), (1, 1, P // 64, D)
+        flags = None if img_ifnew is None else torch.as_tensor(img_ifnew, device=frame.device).reshape(1, 1)
+        f4_t, f8_t, f16_t, f32_t = self._backbone_features(
+            frame, events=events, img_ifnew=flags, frontend_state=frontend_state,
+        )
         f_fused_t = self.fpn(f4_t, f8_t, f16_t, f32_t)      # (1, 1, P, D)
         
         # Squeeze out batch dimension

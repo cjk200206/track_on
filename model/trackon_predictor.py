@@ -60,6 +60,7 @@ class Predictor(torch.nn.Module):
         self.H = self.model.input_size[0]
         self.W = self.model.input_size[1]
         self.device = None
+        self.frontend_state = self.model.backbone.create_state()
 
     def init_queries(self, frame_features, queries, H_in, W_in):
         """
@@ -139,12 +140,14 @@ class Predictor(torch.nn.Module):
             self.N += N_new
 
     @torch.no_grad()
-    def forward_frame(self, frame, new_queries=None):
+    def forward_frame(self, frame, new_queries=None, events=None, img_ifnew=None):
         """
         Track all currently active queries through one frame, optionally adding new queries.
 
         :args frame: Tensor of shape (1, 3, H, W) in range [0, 255]
         :args new_queries: Optional Tensor of shape (N_new, 2), where each query is (x, y), in pixel coordinates
+        :args events: Optional time surface of shape (1, C, H, W)
+        :args img_ifnew: Whether a new RGB arrived; required for motion fusion with events.
         :return P_t: Tensor of shape (N, 2) - positions for all active queries
         :return V_t: Tensor of shape (N,) - visibility for all active queries
         """
@@ -152,7 +155,9 @@ class Predictor(torch.nn.Module):
         _, _, H, W = frame.shape
 
         # Extract features once
-        f4_t, f8_t, f16_t, f32_t, f_fused_t = self.model.extract_frame_features(frame)
+        f4_t, f8_t, f16_t, f32_t, f_fused_t = self.model.extract_frame_features(
+            frame, events=events, img_ifnew=img_ifnew, frontend_state=self.frontend_state,
+        )
 
         # Add new queries if provided
         if new_queries is not None and new_queries.shape[0] > 0:

@@ -169,7 +169,8 @@ def train(args, train_dataloader, model, optimizer, lr_scheduler, scaler, loss_t
     accumulation_steps = int(getattr(args, "grad_accum_steps", 1))
     if accumulation_steps < 1:
         raise ValueError("grad_accum_steps must be a positive integer")
-    train_dataloader = tqdm(train_dataloader, disable=args.rank != 0, file=sys.stdout)
+    train_dataloader = tqdm(train_dataloader, disable=args.rank != 0,
+                            file=sys.stdout, miniters=accumulation_steps)
     optimizer.zero_grad(set_to_none=True)
     accumulated = 0
     skipped_microbatches = 0
@@ -207,7 +208,7 @@ def train(args, train_dataloader, model, optimizer, lr_scheduler, scaler, loss_t
             grad_norm=grad_norm,
         )
         train_dataloader.set_description(
-            f"Loss(avg {accumulated}): {window_loss_sum / accumulated:.5f}"
+            f"Loss(avg {accumulated}): {window_loss_sum / accumulated:.5f}", refresh=False
         )
         accumulated = 0
         skipped_microbatches = 0

@@ -44,15 +44,16 @@ vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
 vit_upsample_factor: 1.143
 M_i: 72
 delta_v: 0.8
+
 lambda_patch_cls: 3.0
 evaluation: true
 # 16 epochs x 282 updates = 4,512 updates; matching 36K needs 8x more samples.
-epoch_num: 16
+epoch_num: 96
 lr: 0.0005
 warmup_ratio: 0.01  # Linear warmup for the first 1% of optimizer steps.
 wd: 0.00001
 bs: 1
-grad_accum_steps: 8  # 4 GPUs x batch 1 x 8 = effective batch 32.
+grad_accum_steps: 4  # 4 GPUs x batch 1 x 8 = effective batch 32.
 grad_checkpoint: true
 amp: true
 seed: 1234

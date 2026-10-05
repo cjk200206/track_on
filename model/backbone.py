@@ -1,12 +1,6 @@
-import os
-
 import torch
-import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
-import torchvision.transforms as T
-
-from model.event_fusion import EventFeatureFusion
 
 
 _RESNET_MEAN = [0.485, 0.456, 0.406]
@@ -14,6 +8,8 @@ _RESNET_STD = [0.229, 0.224, 0.225]
 
 
 class Backbone(nn.Module):
+    """RGB backbone shared by the original tracker and event extensions."""
+
     def __init__(self, args):
         super().__init__()
 
@@ -52,9 +48,6 @@ class Backbone(nn.Module):
             nn.Sequential(nn.Linear(self.adapter_dim, self.D))
         ])
 
-        event_channels = getattr(args, "event_channels", 0)
-        self.event_fusion = EventFeatureFusion(event_channels, self.D) if event_channels else None
-
         # === Positional embedding ===
 
         self.H = self.size[0]
@@ -86,43 +79,26 @@ class Backbone(nn.Module):
         return feat
 
         
-    def forward(self, video, events=None):
-        # :args video: (B, T, C, self.H, self.W) in range [0, 1]
-        # :args queries: (B, N, 3) where 3 is (t, x, y)
-        #
-        # :return f4, f8, f16, f32: (B, T, P, D), (B, T, P // 4, D), (B, T, P // 16, D), (B, T, P // 64, D)
+    def create_state(self):
+        """Return optional caller-owned state for streaming inference."""
+        return None
 
-        B, T, _, H, W = video.shape
-        D = self.D
-        assert H == self.H and W == self.W, f"Input video size {H}x{W} does not match the expected size {self.H}x{self.W}"
+    def _encode_rgb(self, images):
+        images = (images - self._resnet_mean) / self._resnet_std
+        return tuple(self.project_feat(feat, i) for i, feat in enumerate(self.vit_encoder(images)))
 
-        video_flat = video.view(B * T, 3, H, W) # * 2 - 1.0                           # to [-1, 1]
-        video_flat = (video_flat - self._resnet_mean) / self._resnet_std              # Normalize to [-1, 1] range
+    def _add_position(self, features):
+        return tuple(
+            feat + F.interpolate(self.pos_embedding, size=feat.shape[-2:], mode="bilinear", align_corners=False)
+            for feat in features
+        )
 
-        # === Extract features ===
-        f4, f8, f16, f32 = self.vit_encoder(video_flat)               # (B * T, 384, H4, W4)
+    def _to_tokens(self, features, batch, time):
+        return tuple(feat.flatten(2).transpose(1, 2).reshape(batch, time, -1, self.D) for feat in features)
 
-        pos4 = self.pos_embedding                                                                               # (1, D, H4, W4)
-        pos8 = F.interpolate(self.pos_embedding, scale_factor=0.5, mode='bilinear', align_corners=False)        # (1, D, H8, W8)
-        pos16 = F.interpolate(self.pos_embedding, scale_factor=0.25, mode='bilinear', align_corners=False)      # (1, D, H16, W16)
-        pos32 = F.interpolate(self.pos_embedding, scale_factor=0.125, mode='bilinear', align_corners=False)     # (1, D, H32, W32)
-
-        f4 = self.project_feat(f4, idx=0) + pos4                                                 # (B * T, D, H4, W4)
-        f8 = self.project_feat(f8, idx=1) + pos8                                                 # (B * T, D, H8, W8)           
-        f16 = self.project_feat(f16, idx=2) + pos16                                              # (B * T, D, H16, W16)
-        f32 = self.project_feat(f32, idx=3) + pos32                                              # (B * T, D, H32, W32)
-
-        if events is not None:
-            if self.event_fusion is None:
-                raise ValueError("events were provided, but event_channels is not configured")
-            f4, f8, f16, f32 = self.event_fusion((f4, f8, f16, f32), events)
-        # === === ===
-
-        # === Reshape & Permute ===
-        f4 = f4.permute(0, 2, 3, 1).view(B, T, self.P, D)                    # (B, T, P, D)
-        f8 = f8.permute(0, 2, 3, 1).view(B, T, self.P // 4, D)               # (B, T, P // 4, D)
-        f16 = f16.permute(0, 2, 3, 1).view(B, T, self.P // 16, D)            # (B, T, P // 16, D)
-        f32 = f32.permute(0, 2, 3, 1).view(B, T, self.P // 64, D)            # (B, T, P // 64, D)
-        
-        return f4, f8, f16, f32
-
+    def forward(self, video):
+        """Return four RGB token scales with shape (B, T, P_s, D)."""
+        batch, time, _, height, width = video.shape
+        assert (height, width) == (self.H, self.W), "Input video size must match input_size"
+        features = self._encode_rgb(video.reshape(batch * time, 3, height, width))
+        return self._to_tokens(self._add_position(features), batch, time)

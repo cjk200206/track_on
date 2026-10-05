@@ -1,16 +1,25 @@
-# Paired Kubric feasibility experiment; run with python main_frame_event.py.
-train_root: data/event_kubric/train
-val_root: data/event_kubric/val
-checkpoint_path: checkpoints/trackon2_dinov3_checkpoint.pt
+# Train Track-On2 with paired blurred RGB frames and event time surfaces.
+event_kubric_root: data/event_kubric
+event_kubric_val_root: data/event_kubric/val
+event_kubric_sources:
+  - {name: train, weight: 60, val_fraction: 0.0}
+  - {name: sup_panning, weight: 40, val_fraction: 0.1}
+split_seed: 1234
+event_kubric_base_val_limit: 32
+event_kubric_val_per_source: 8
+samples_per_epoch: 9024
+checkpoint_path: null  # Random tracker; DINOv3 remains pretrained and frozen.
+train_event_only: false
 output_dir: outputs/frame_event
 
 input_size: [384, 512]
 T: 24
-N: 128
-train_sequences: 512
-val_sequences: 64
+N: 192
+val_points: 128
 frame_interval: 4
-num_workers: 2
+bs: 1
+num_workers: 4
+val_num_workers: 2
 
 M: 24
 D: 256
@@ -21,15 +30,18 @@ rerank_layer_num: 3
 vit_backbone: dinov3_s_plus
 vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
 vit_upsample_factor: 1.143
-grad_checkpoint: false
+grad_checkpoint: true
 event_channels: 10
 
 lambda_patch_cls: 3.0
 delta_v: 0.8
-max_steps: 1000
+epoch_num: 96
+grad_accum_steps: 4
+warmup_ratio: 0.01
+save_every: 5
 overfit_steps: 100
 log_every: 20
 lr: 0.0005
 wd: 0.00001
-amp: true  # FP16 autocast; frozen RGB model needs no gradient scaler
+amp: true
 seed: 1234

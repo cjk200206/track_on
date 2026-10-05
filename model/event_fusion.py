@@ -4,19 +4,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from model.event_encoder import build_event_encoder
+
 
 class EventFeatureFusion(nn.Module):
     """Add a time surface to the four projected RGB feature scales."""
 
-    def __init__(self, event_channels, dim):
+    def __init__(self, event_channels, dim, encoder=None):
         super().__init__()
         self.event_channels = event_channels
-        self.encoder = nn.Sequential(
-            nn.Conv2d(event_channels, 64, kernel_size=3, stride=2, padding=1),
-            nn.GELU(),
-            nn.Conv2d(64, dim, kernel_size=3, stride=2, padding=1),
-            nn.GELU(),
-        )
+        self.encoder = encoder if encoder is not None else build_event_encoder(event_channels, dim)
         # Zero gates preserve the pretrained RGB model before event training.
         self.gates = nn.Parameter(torch.zeros(4))
 

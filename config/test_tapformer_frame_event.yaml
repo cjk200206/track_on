@@ -1,0 +1,42 @@
+# Evaluate the trained frame+event model at every event step, scoring RGB timestamps.
+# Paths are relative to the Track-On2 repository root.
+dataset_root: ../TAPFormer/data/TAPFormer_Dataset
+input_mode: frame_event
+model_config: outputs/frame_event/20260929_180053/run_config.json
+checkpoint: outputs/frame_event/20260929_180053/best.pt
+output_dir: outputs/real_tapformer_frame_event_20260929
+csv_filename: summary.csv
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+event_dt:
+  InivTAP: auto       # Each sequence has one numeric time-surface cache.
+  DrivTAP: "0.0100"
+drivtap_gt_mode: downsample_even
+support_grid_size: 20
+inference_memory_size: 72
+device: auto
+amp: true
+save_predictions: false
+
+visualization:
+  enabled: true
+  format: mp4          # H.264; webm is also available for VS Code compatibility.
+  fps: 10
+  trail_length: 8
+  max_width: 960
