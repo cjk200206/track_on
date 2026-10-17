@@ -11,6 +11,7 @@ from model.event_backbone import EventBackbone, build_backbone
 from model.modules import MHA_Block, SimpleFPN
 from model.prediction_head import Prediction_Head
 from model.reranking import Rerank_Module
+from model.trajectory_history import TrajectoryHistoryScorer, trajectory_entry
 
 from utils.coord_utils import indices_to_coords
 
@@ -50,6 +51,17 @@ class Track_On2(nn.Module):
         self.projection1 = nn.Linear(args.D, args.D)
         self.projection2 = nn.Linear(args.D, args.D)
         self.ms_corr_proj = nn.Conv2d(4, 1, kernel_size=1, stride=1, padding=0)
+        history_size = int(getattr(args, "trajectory_history_size", 0))
+        if history_size > self.M:
+            raise ValueError("trajectory_history_size must not exceed M")
+        self.trajectory_scorer = (TrajectoryHistoryScorer(
+            self.D, self.input_size, history_size,
+            hidden_dim=int(getattr(args, "trajectory_history_dim", 32)),
+            max_bias=float(getattr(args, "trajectory_history_max_bias", 0.5)),
+        ) if history_size else None)
+        self.trajectory_history_stages = getattr(args, "trajectory_history_stages", "both")
+        if self.trajectory_history_stages not in {"both", "c1", "c2", "none"}:
+            raise ValueError("trajectory_history_stages must be both, c1, c2, or none")
         # === === ===
 
         # === Time Positional Embedding for memory ===
@@ -74,6 +86,8 @@ class Track_On2(nn.Module):
 
 
     def memory_extension(self, new_memory_size):
+        if self.trajectory_scorer is not None and new_memory_size < self.trajectory_scorer.history_size:
+            raise ValueError("Inference memory must contain at least trajectory_history_size slots")
         pos_embedding = self.t_embedding.clone()  # (1, self.memory_size + 1, self.embedding_dim)
         pos_embedding_past = pos_embedding[:, :-1]
         pos_embedding_now = pos_embedding[:, -1].unsqueeze(dim=1)  # (1, 1, self.embedding_dim)
@@ -85,7 +99,8 @@ class Track_On2(nn.Module):
 
         self.M = new_memory_size
         
-    def multiscale_correlation(self, q, h4, h8, h16, h32):
+    def multiscale_correlation(self, q, h4, h8, h16, h32,
+                              trajectory_history=None, temporal_mask=None, stage=0):
         # :args q: (1, N, D)
         # :args h4: (1, P, D)
         # :args f8: (1, P // 4, D)
@@ -117,6 +132,9 @@ class Track_On2(nn.Module):
 
         c = c.view(1, N, self.P)                     # (N, P)
 
+        if (self.trajectory_scorer is not None and trajectory_history is not None
+                and self.trajectory_history_stages in {"both", f"c{stage + 1}"}):
+            c = self.trajectory_scorer(c, q, trajectory_history, temporal_mask, stage)
         return c
     
     # Multiscale ViT-Adapter
@@ -181,6 +199,8 @@ class Track_On2(nn.Module):
         # === Memory initialization ===
         point_memory = torch.zeros(B, N, M, D, device=device)                             # (B, N, M, D)
         temporal_mask = torch.ones(B, N, M, device=device, dtype=torch.bool)              # True if masked, (B, N, M)
+        trajectory_history = (torch.zeros(B, N, M, 4, device=device)
+                              if self.trajectory_scorer is not None else None)
         # === === ===
 
         # === Output initialization ===
@@ -208,6 +228,7 @@ class Track_On2(nn.Module):
                     continue
                 
                 memory_mask_t = temporal_mask[b, available_queries]                # (N_t, M)
+                history_t = None if trajectory_history is None else trajectory_history[b, available_queries]
                 memory = point_memory[b, available_queries].clone()              # (N_t, M, D)
                 
                 q_t = query_init[b, available_queries].clone().unsqueeze(0)      # (1, N_t, D)
@@ -247,11 +268,13 @@ class Track_On2(nn.Module):
                 # === === ===
 
                 # === Re-ranking ===
-                c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                             # (1, N_t, P)
+                c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
+                                                 trajectory_history=history_t, temporal_mask=memory_mask_t, stage=0)
 
                 q_t, p_patch_top_k, u_logit_top_k, s_logit_top_k = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)  # (1, N_t, D), (1, N_t, K, 2), (1, N_t, K), (1, N_t, K)
                 q_t = self.projection2(q_t)                                                             # (1, N_t, D)
-                c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                                        # (1, N_t, P)
+                c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
+                                                 trajectory_history=history_t, temporal_mask=memory_mask_t, stage=1)
 
                 p_patch = indices_to_coords(torch.argmax(c2.detach(), dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N_t, 2), in range [H, W]
                 p_patch = p_patch.squeeze(1)                                                                               # (1, N_t, 2)
@@ -277,6 +300,12 @@ class Track_On2(nn.Module):
                 point_memory_slice = torch.zeros(N, 1, D, device=device, dtype=q_t.dtype)  # (N, 1, D)
                 point_memory_slice[available_queries] = q_t.clone().view(N_t, 1, D)
                 point_memory[b] = torch.cat([point_memory[b, :, 1:], point_memory_slice], dim=1)                # (N, M, D)
+
+                if trajectory_history is not None:
+                    history_slice = trajectory_history.new_zeros(N, 1, 4)
+                    history_slice[available_queries, 0] = trajectory_entry(
+                        p_patch[0] + o[-1], v_logit, u_logit, self.input_size)
+                    trajectory_history[b] = torch.cat((trajectory_history[b, :, 1:], history_slice), dim=1)
 
                 # Update Temporal Mask
                 temporal_mask[b] = torch.cat([temporal_mask[b, :, 1:], ~available_queries.view(N, 1)], dim=1)   # (N, M)
@@ -327,6 +356,8 @@ class Track_On2(nn.Module):
         # === Memory initialization ===
         point_memory = torch.zeros(B, N, M, D, device=device)                             # (B, N, M, D)
         temporal_mask = torch.ones(B, N, M, device=device, dtype=torch.bool)              # True if masked, (B, N, M)
+        trajectory_history = (torch.zeros(B, N, M, 4, device=device)
+                              if self.trajectory_scorer is not None else None)
         # === === ===
 
         # === Output initialization ===
@@ -345,6 +376,7 @@ class Track_On2(nn.Module):
                     continue
                 
                 memory_mask_t = temporal_mask[b, available_queries]                # (N_t, M)
+                history_t = None if trajectory_history is None else trajectory_history[b, available_queries]
                 memory = point_memory[b, available_queries].clone()                # (N_t, M, D)
 
                 # === Visual Backbone Feedforward ===
@@ -404,11 +436,13 @@ class Track_On2(nn.Module):
                 # === === ===
 
                 # === Re-ranking ===
-                c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                             # (1, N_t, P)
+                c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
+                                                 trajectory_history=history_t, temporal_mask=memory_mask_t, stage=0)
                 q_t, _, _, _ = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)  # (1, N_t, D), (1, N_t, K, 2), (1, N_t, K), (1, N_t, K)
                 q_t = self.projection2(q_t)                                                            # (1, N_t, D)
 
-                c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                                        # (1, N_t, P)
+                c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
+                                                 trajectory_history=history_t, temporal_mask=memory_mask_t, stage=1)
                 p_patch = indices_to_coords(torch.argmax(c2.detach(), dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N_t, 2), in range [H, W]
                 p_patch = p_patch.squeeze(1)                                                                               # (1, N_t, 2)
                 # === === ===
@@ -426,6 +460,12 @@ class Track_On2(nn.Module):
                 point_memory_slice = torch.zeros(N, 1, D, device=device, dtype=q_t.dtype)  # (N, 1, D)
                 point_memory_slice[available_queries] = q_t.clone().view(N_t, 1, D)
                 point_memory[b] = torch.cat([point_memory[b, :, 1:], point_memory_slice], dim=1)                # (N, M, D)
+
+                if trajectory_history is not None:
+                    history_slice = trajectory_history.new_zeros(N, 1, 4)
+                    history_slice[available_queries, 0] = trajectory_entry(
+                        p_patch[0] + o[-1], v_logit, u_logit, self.input_size)
+                    trajectory_history[b] = torch.cat((trajectory_history[b, :, 1:], history_slice), dim=1)
 
                 # Update Temporal Mask
                 temporal_mask[b] = torch.cat([temporal_mask[b, :, 1:], ~available_queries.view(N, 1)], dim=1)   # (N, M)
@@ -481,7 +521,8 @@ class Track_On2(nn.Module):
         return f4_t, f8_t, f16_t, f32_t, f_fused_t
 
     @torch.no_grad()
-    def track_frame(self, q_init, temporal_mask, point_memory, frame_features, H_in, W_in):
+    def track_frame(self, q_init, temporal_mask, point_memory, frame_features, H_in, W_in,
+                    trajectory_history=None, return_uncertainty=False):
         """
         Track queries through one frame using pre-extracted features.
         
@@ -491,6 +532,8 @@ class Track_On2(nn.Module):
         :args frame_features: Tuple of (f4_t, f8_t, f16_t, f32_t, f_fused_t)
         :args H_in: Original frame height
         :args W_in: Original frame width
+        :args trajectory_history: Optional (N, M, 4), normalized xy and past v/u probabilities
+        :args return_uncertainty: Include uncertainty logits in the returned tuple
         :return: (p, v_logit, q_new) where p is (N, 2), v_logit is (N,), q_new is (N, D)
         """
         N, D = q_init.shape
@@ -502,6 +545,7 @@ class Track_On2(nn.Module):
         q_t = q_init.unsqueeze(0).clone()                  # (1, N, D)
         memory_mask_t = temporal_mask.clone()              # (N, M)
         memory = point_memory.clone()                      # (N, M, D)
+        history_t = trajectory_history
 
         # === Query Decoder ===
         # Pre-allocate buffers for efficiency
@@ -538,11 +582,13 @@ class Track_On2(nn.Module):
         # === === ===
 
         # === Re-ranking ===
-        c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                             # (1, N, P)
+        c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
+                                         trajectory_history=history_t, temporal_mask=memory_mask_t, stage=0)
         q_t, _, _, _ = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)  # (1, N, D), (1, N, K, 2), (1, N, K), (1, N, K)
         q_t = self.projection2(q_t)                                                            # (1, N, D)
 
-        c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t)                                        # (1, N, P)
+        c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
+                                         trajectory_history=history_t, temporal_mask=memory_mask_t, stage=1)
         p_patch = indices_to_coords(torch.argmax(c2, dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N, 2), in range [H, W]
         p_patch = p_patch.squeeze(1)                                                                               # (1, N, 2)
         # === === ===
@@ -559,4 +605,6 @@ class Track_On2(nn.Module):
         p[..., 1] = (p[..., 1] / self.H) * H_in
         # === === ===
 
+        if return_uncertainty:
+            return p, v_logit, q_t.squeeze(0), u_logit
         return p, v_logit, q_t.squeeze(0)  # (N, 2), (N), (N, D)

@@ -4,3 +4,6 @@ __pycache__/
 outputs/
 data/
 *.log
+*.out
+tests/*
+!tests/test_event_recurrent.py

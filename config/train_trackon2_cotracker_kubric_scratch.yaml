@@ -1,0 +1,54 @@
+# Original RGB Track-On2 on official CoTracker3 Kubric, with no trajectory scorer.
+# Initialize the tracker from scratch; DINO remains pretrained and frozen.
+init_checkpoint_path: null
+checkpoint_path: null
+model_save_path: outputs/trackon2_cotracker_kubric_scratch
+
+# Extract each archive into a sequence directory: 0000/0000.npy, 0000/frames/...
+# The budget below assumes all 6,000 sequences have finished downloading/extracting.
+train_dataset: kubric
+movi_f_root: data/CoTracker3_Kubric
+eval_dataset: davis
+tapvid_root: data/tapvid_davis/tapvid_davis.pkl
+num_workers: 8
+val_num_workers: 4
+logging_backend: tensorboard
+eval_every_epochs: 1
+best_metric: aj
+save_every: 4
+
+# Match the previous panning baseline's actual spatial/temporal training settings.
+frame_sampling: uniform
+frame_sample_ratio: 2.0
+input_size: [384, 512]
+N: 192
+T: 24
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+M_i: 72
+delta_v: 0.8
+trajectory_history_size: 0
+train_trajectory_scorer_only: false
+
+lambda_patch_cls: 3.0
+evaluation: true
+# Three GPUs x batch 1 x accumulation 8 = effective batch 24, matching the baseline.
+# 6,000 sequences: 250 updates/epoch x 144 epochs = 36,000 updates before AMP skips.
+# Use accumulation 4 on six GPUs to preserve the same effective batch and schedule.
+# best.pt follows DAVIS AJ; compare fixed-update checkpoints with the old baseline.
+epoch_num: 144
+lr: 0.0005
+warmup_ratio: 0.01
+wd: 0.00001
+bs: 1
+grad_accum_steps: 8
+grad_checkpoint: true
+amp: true
+seed: 1234

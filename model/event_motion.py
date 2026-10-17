@@ -106,6 +106,10 @@ class MotionEventFusion(EventFeatureFusion):
         if events.ndim != 4 or events.shape[1] != self.event_channels:
             raise ValueError("events must have shape (B, configured event_channels, H, W)")
         event4 = self.encoder(events)
+        return self.encode_motion(events, event4)
+
+    def encode_motion(self, events, event4):
+        """Build motion inputs from shared event features without encoding twice."""
         motion8 = self.motion_encoder(event4)
         activity = events.ne(0).any(dim=1, keepdim=True).to(event4.dtype)
         activity = F.adaptive_max_pool2d(activity, event4.shape[-2:])

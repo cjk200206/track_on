@@ -81,8 +81,11 @@ def make_loader(args, training, rank=0, world_size=1):
         max_sequences=None if mixed_sources else (args.train_sequences if training else args.val_sequences),
         training=training,
         seed=args.seed,
+        eval_start=0 if training else getattr(args, "eval_start", 0),
         sequence_paths=paths,
         anchor_aligned=getattr(args, "event_fusion_type", "simple") != "simple",
+        spatial_augmentation=getattr(args, "spatial_augmentation", False),
+        spatial_scale_range=getattr(args, "spatial_scale_range", (1.0, 1.2)),
     )
     if training and mixed_sources:
         sampler = WeightedDistributedSampler(
@@ -295,7 +298,8 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
             window_steps = 0
 
 
-def train_full(model, loader, val_loader, args, device, rank, max_steps=None, skip_eval=False, resume_path=None):
+def train_full(model, loader, val_loader, args, device, rank, max_steps=None, skip_eval=False, resume_path=None,
+               reset_best=False):
     accumulation = args.grad_accum_steps
     if accumulation < 1:
         raise ValueError("grad_accum_steps must be positive")
@@ -327,7 +331,7 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"])
         total_steps = int(checkpoint["step"])
-        best_aj = float(checkpoint["best_aj"])
+        best_aj = -1.0 if reset_best else float(checkpoint["best_aj"])
         if rank == 0:
             print(f"Resumed from {resume_path}: epoch={start_epoch}, step={total_steps}, "
                   f"best AJ={best_aj:.4f}, AMP scale={scaler.get_scale():g}", flush=True)
@@ -434,6 +438,11 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
         if max_steps is not None and total_steps >= max_steps:
             break
 
+    # Final validation can outlast the NCCL timeout; close the group first.
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
+
     if rank == 0 and not skip_eval:
         load_event_checkpoint(raw_model, output_dir / "best.pt", device)
         results = {mode: evaluate(raw_model, val_loader, args, device, mode)
@@ -452,8 +461,11 @@ def main():
     parser.add_argument("--skip-eval", action="store_true")
     parser.add_argument("--output-dir", type=str)
     parser.add_argument("--resume", type=str, help="Full-training checkpoint to resume in its original run directory")
+    parser.add_argument("--reset-best", action="store_true", help="Reset best AJ and start a new run directory for changed validation data")
     parser.add_argument("--eval-checkpoint", type=str)
     cli = parser.parse_args()
+    if cli.reset_best and not cli.resume:
+        parser.error("--reset-best requires --resume")
     if cli.resume:
         if cli.check_data or cli.overfit_one_batch or cli.eval_checkpoint or cli.output_dir:
             parser.error("--resume cannot be combined with --check-data, --overfit-one-batch, "
@@ -468,7 +480,8 @@ def main():
     if cli.resume:
         if not hasattr(args, "epoch_num"):
             parser.error("--resume requires a full-training config with epoch_num")
-        args.output_dir = str(Path(cli.resume).parent)
+        if not cli.reset_best:
+            args.output_dir = str(Path(cli.resume).parent)
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -522,13 +535,14 @@ def main():
     device = torch.device("cuda", local_rank if world_size > 1 else 0)
     if cli.eval_checkpoint and rank != 0:
         return
-    if not cli.resume:
+    if not cli.resume or cli.reset_best:
         args.output_dir = str(create_run_directory(args.output_dir))
     if rank == 0:
         print(f"run directory: {args.output_dir}", flush=True)
-        if not cli.resume:
+        if not cli.resume or cli.reset_best:
             with (Path(args.output_dir) / "run_config.json").open("w") as handle:
-                json.dump({"config_path": cli.config, "args": vars(args)}, handle, indent=2)
+                json.dump({"config_path": cli.config, "args": vars(args),
+                           "resume": cli.resume, "reset_best": cli.reset_best}, handle, indent=2)
     model = build_model(args, device)
     if cli.eval_checkpoint:
         load_event_checkpoint(model, cli.eval_checkpoint, device)
@@ -539,10 +553,8 @@ def main():
         if hasattr(args, "epoch_num") and not cli.overfit_one_batch:
             val_loader = make_loader(args, training=False) if rank == 0 and not cli.skip_eval else None
             train_full(model, train_loader, val_loader, args, device, rank,
-                       max_steps=cli.max_steps, skip_eval=cli.skip_eval, resume_path=cli.resume)
-            if dist.is_initialized():
-                dist.barrier()
-                dist.destroy_process_group()
+                       max_steps=cli.max_steps, skip_eval=cli.skip_eval, resume_path=cli.resume,
+                       reset_best=cli.reset_best)
             return
         steps = cli.max_steps if cli.max_steps is not None else (
             args.overfit_steps if cli.overfit_one_batch else args.max_steps

@@ -1,7 +1,10 @@
-# Baseline: 60% original train, 40% panning. Only panning is split 90/10.
+# Baseline on the same four delayed-motion sources as frame_event_motion_etap_new.
+# Panning totals 40%; every source uses a 0.1 held-out validation fraction.
 event_kubric_sources:
-  - {name: train, weight: 60, val_fraction: 0.0}
-  - {name: sup_panning, weight: 40, val_fraction: 0.1}
+  - {name: train_batch, weight: 30, val_fraction: 0.1}
+  - {name: train_seq, weight: 30, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 20, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 20, val_fraction: 0.1}
 
 # RGB-only Track-On2 pretraining on existing ETAP/TAPFormer EventKubric data.
 # One epoch draws 9,024 sequences globally; 4 GPUs x 1 x 8 gives 282 updates.
@@ -10,15 +13,12 @@ logging_backend: tensorboard  # Set to wandb to use the original online logger.
 eval_dataset: kubric
 movi_f_root: data/event_kubric/train  # Used by the shared Movi-F augmentation base.
 event_kubric_root: data/event_kubric
-event_kubric_val_root: data/event_kubric/val
 split_seed: 1234
 event_kubric_rgb_variant: sharp  # raw/rgba_*.png, never rgba_blur_*.png
-event_kubric_base_val_limit: 32
-event_kubric_val_per_source: 8
 event_kubric_eval_points: 128
 samples_per_epoch: 9024
-num_workers: 4  # Per GPU; the original fixed 32 workers per GPU is excessive here.
-val_num_workers: 2
+num_workers: 8  # Per GPU; the original fixed 32 workers per GPU is excessive here.
+val_num_workers: 4
 eval_every_epochs: 1
 best_metric: aj  # best.pt follows Kubric validation AJ.
 save_every: 5  # Save epoch_XXXX.pt every 5 epochs; last.pt is saved every epoch.
@@ -43,7 +43,7 @@ vit_backbone: dinov3_s_plus
 vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
 vit_upsample_factor: 1.143
 M_i: 72
-delta_v: 0.8
+delta_v: 0.9
 
 lambda_patch_cls: 3.0
 evaluation: true

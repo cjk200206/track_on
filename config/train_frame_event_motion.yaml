@@ -1,12 +1,9 @@
 # Optional motion frontend; change motion_state to motion_pool for a history pool.
 event_kubric_root: data/event_kubric
-event_kubric_val_root: data/event_kubric/val
 event_kubric_sources:
   - {name: train, weight: 60, val_fraction: 0.0}
   - {name: sup_panning, weight: 40, val_fraction: 0.1}
 split_seed: 1234
-event_kubric_base_val_limit: 32
-event_kubric_val_per_source: 8
 samples_per_epoch: 9024
 checkpoint_path: null  # Random tracker; DINOv3 remains pretrained and frozen.
 train_event_only: false

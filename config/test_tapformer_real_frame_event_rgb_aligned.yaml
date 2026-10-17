@@ -1,0 +1,44 @@
+# Complete RGB-interval coverage: Iniv 3 windows in practice; Driv fixed 2.
+# Keep the existing RGB-time GT scoring protocol for comparison with old caches.
+# Driv N RGB frames produce 2N-1 inputs (RGB timestamps plus interval midpoints).
+# Its original 2N GT entries have no saved timestamps; midpoint GT scoring is not assumed here.
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+input_mode: frame_event
+model_config: outputs/frame_event_motion_etap_new/20261007_151640/run_config.json
+checkpoint: outputs/frame_event_motion_etap_new/20261007_151640/best.pt
+output_dir: outputs/real_tapformer_frame_event_rgb_aligned
+csv_filename: summary.csv
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+event_dt:
+  InivTAP: rgb_aligned_20ms_max6
+  DrivTAP: rgb_aligned_2
+drivtap_gt_mode: downsample_even
+support_grid_size: 20
+inference_memory_size: 72
+device: auto
+amp: true
+save_predictions: false
+
+visualization:
+  enabled: true
+  format: mp4
+  fps: 10
+  trail_length: 8
+  max_width: 960

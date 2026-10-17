@@ -1,0 +1,54 @@
+# Paired augmentation: same control settings, with clip-consistent geometry.
+event_kubric_root: data/event_kubric
+event_kubric_sources:
+  - {name: train_batch, weight: 30, val_fraction: 0.1}
+  - {name: train_seq, weight: 30, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 20, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 20, val_fraction: 0.1}
+split_seed: 1234
+samples_per_epoch: 9024
+checkpoint_path: outputs/frame_event_motion_etap_new/20261007_151640/best.pt
+train_event_only: false
+output_dir: outputs/frame_event_spatial_aug
+
+input_size: [384, 512]
+T: 24
+N: 192
+val_points: 128
+frame_interval: 4
+spatial_augmentation: true
+spatial_scale_range: [1.0, 1.2]
+eval_start: null
+bs: 1
+num_workers: 4
+val_num_workers: 2
+
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+grad_checkpoint: true
+event_channels: 10
+event_fusion_type: motion_state
+event_motion_dim: 64
+event_encoder: etap
+event_pretrained_path: checkpoints/ETAP_v1_cvpr25.pth
+
+lambda_patch_cls: 3.0
+delta_v: 0.8
+# Six GPUs x batch 1 x accumulation 4: 1,128 updates across three epochs.
+epoch_num: 3
+grad_accum_steps: 4
+warmup_ratio: 0.01
+save_every: 1
+overfit_steps: 100
+log_every: 20
+lr: 0.00005
+wd: 0.00001
+amp: true
+seed: 1234

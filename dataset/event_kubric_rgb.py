@@ -39,13 +39,6 @@ def split_source(paths, fraction, seed):
     return [path for i, path in enumerate(paths) if i not in val_ids], [path for i, path in enumerate(paths) if i in val_ids]
 
 
-def fixed_eval_subset(paths, limit, seed):
-    if limit < 1:
-        raise ValueError("Validation sequence limit must be positive")
-    return sorted(paths, key=lambda path: hashlib.sha256(
-        f"{seed}:eval:{path.parent.name}:{path.name}".encode()).digest())[:limit]
-
-
 def build_sources(args):
     root = Path(args.event_kubric_root)
     train_paths, val_paths, group_ids, group_weights = [], [], [], []
@@ -64,7 +57,7 @@ def build_sources(args):
         train_paths.extend(source_train)
         group_ids.extend([group_id] * len(source_train))
         group_weights.append(weight)
-        val_paths.extend(fixed_eval_subset(source_val, args.event_kubric_val_per_source, args.split_seed))
+        val_paths.extend(source_val)
         held_out_ids.update(path.name for path in source_val)
         print(f"Kubric {name}: {len(source_train)} source-train, {len(source_val)} held-out val, weight={weight:g}")
 
@@ -75,8 +68,6 @@ def build_sources(args):
     group_ids = [group for _, group in kept]
     if len(set(group_ids)) != len(group_weights):
         raise ValueError("A source became empty after removing shared validation IDs")
-    base_val = sequence_dirs(args.event_kubric_val_root)
-    val_paths = fixed_eval_subset(base_val, args.event_kubric_base_val_limit, args.split_seed) + val_paths
     if not val_paths:
         raise ValueError("No Kubric validation sequences")
     print(f"Kubric final training: {len(train_paths)} sequences after shared-ID exclusion")

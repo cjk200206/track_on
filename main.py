@@ -23,6 +23,7 @@ from utils.train_utils import init_distributed_mode, fix_random_seeds
 from utils.train_utils import get_dataloaders, get_scheduler
 from utils.train_utils import restart_from_checkpoint
 from utils.train_utils import load_args_from_yaml
+from utils.train_utils import load_pretrained_weights
 
 from utils.tensorboard_utils import init_tensorboard, TensorBoardLossTracker, LOSS_NAMES
 
@@ -164,6 +165,10 @@ def nonfinite_loss_details(args, epoch, batch_index, loss_values, loss_fn, visib
 
 def train(args, train_dataloader, model, optimizer, lr_scheduler, scaler, loss_tracker, epoch):
     model.train()
+    if getattr(args, "train_trajectory_scorer_only", False):
+        # Keep the frozen tracker's running statistics and dropout fixed.
+        model.eval()
+        model.module.trajectory_scorer.train()
 
     loss_fn = Loss_Function(args)
     accumulation_steps = int(getattr(args, "grad_accum_steps", 1))
@@ -407,6 +412,22 @@ def evaluate(args, val_dataloader, model, epoch, writer=None, global_step=None,
     return smaller_delta_avg, aj, oa
 
 
+def build_training_model(args):
+    model = Track_On2(args)
+    init_checkpoint = getattr(args, "init_checkpoint_path", None)
+    # Resuming restores the complete training state below and takes precedence.
+    if init_checkpoint and args.checkpoint_path is None:
+        allowed = ("trajectory_scorer.",) if model.trajectory_scorer is not None else ()
+        load_pretrained_weights(model, init_checkpoint, extra_allowed_missing_prefixes=allowed)
+        print("Initialized model weights for a new training run; optimizer and progress start fresh.")
+    if getattr(args, "train_trajectory_scorer_only", False):
+        if model.trajectory_scorer is None:
+            raise ValueError("train_trajectory_scorer_only requires trajectory_history_size > 0")
+        model.requires_grad_(False)
+        model.trajectory_scorer.requires_grad_(True)
+    return model
+
+
 def main_worker(args, config_path):
     logging_backend = getattr(args, "logging_backend", "tensorboard").lower()
     if logging_backend not in ("tensorboard", "wandb"):
@@ -440,7 +461,7 @@ def main_worker(args, config_path):
     # === === ===
     
     # === Model & Training ===
-    model = Track_On2(args).to(args.gpu)
+    model = build_training_model(args).to(args.gpu)
     model = nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu], find_unused_parameters=False)
 
     optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr, weight_decay=args.wd)
@@ -472,6 +493,9 @@ def main_worker(args, config_path):
             run_variables=to_restore,
             **checkpoint_objects,
         )
+    if getattr(args, "reset_best", False):
+        for metric in ("best_aj", "best_oa", "best_delta_avg"):
+            to_restore[metric] = [-1, -1]
     if warmup_ratio:
         for group in optimizer.param_groups:
             group["lr"] = args.lr
@@ -608,9 +632,19 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Training for Track-On2")
 
     parser.add_argument("--config_path", type=str, required=True, help='Path to the config file')
+    parser.add_argument("--resume", type=str, help="Training checkpoint to resume in a new run directory")
+    parser.add_argument("--reset-best", action="store_true", help="Reset best metrics when changing validation data")
     args_cmd = parser.parse_args()
 
     args = load_args_from_yaml(args_cmd.config_path)
+    if args_cmd.reset_best and not args_cmd.resume:
+        parser.error("--reset-best requires --resume")
+    if args_cmd.resume:
+        checkpoint_path = Path(args_cmd.resume).resolve()
+        if not checkpoint_path.is_file():
+            parser.error(f"resume checkpoint does not exist: {checkpoint_path}")
+        args.checkpoint_path = str(checkpoint_path)
+    args.reset_best = args_cmd.reset_best
     
     args.gpus = torch.cuda.device_count()
     try:

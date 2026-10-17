@@ -1,0 +1,38 @@
+# Evaluate the completed first epoch, independent of later best/last updates.
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+model_config: outputs/trackon2_trajectory_history_finetune/20261015_202733/run_config.json
+checkpoint: outputs/trackon2_trajectory_history_finetune/20261015_202733/best.pt
+output_dir: outputs/real_tapformer_trackon2_trajectory_history/20261015_202733
+csv_filename: summary.csv
+input_mode: rgb
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+drivtap_gt_mode: downsample_even
+support_grid_size: 20
+inference_memory_size: 72
+device: auto
+amp: true
+save_predictions: true
+
+visualization:
+  enabled: true
+  format: mp4
+  fps: 10
+  trail_length: 8
+  max_width: 960

@@ -4,6 +4,9 @@ Run from the repository root:
     python -m evaluation.test_tapformer_real --config config/test_tapformer_real.yaml
     python -m evaluation.test_tapformer_real --config config/test_tapformer_frame_event.yaml
 """
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
+os.environ["HDF5_USE_FILE_LOCKING"] = "FALSE"  # Avoid HDF5 file locking issues on some network filesystems.
 
 import argparse
 import json

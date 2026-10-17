@@ -1,9 +1,11 @@
 # Paths are relative to the Track-On2 repository root.
-dataset_root: ../TAPFormer/data/TAPFormer_Dataset
-model_config: config/test.yaml
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+# model_config: config/test.yaml
 # checkpoint: checkpoints/trackon2_dinov3_checkpoint.pt
-checkpoint: outputs/trackon2_kubric_panning/20260925_170703/best.pt
-output_dir: outputs/real_tapformer_trackon2_0925_1
+
+model_config: config/train_trackon2_kubric_panning.yaml
+checkpoint: outputs/trackon2_kubric_panning/20261009_204126/best.pt
+output_dir: outputs/real_tapformer_trackon2_1009
 csv_filename: summary.csv
 
 # Matches the available sequences in TAPFormer's InivTAP/DrivTAP evaluation.

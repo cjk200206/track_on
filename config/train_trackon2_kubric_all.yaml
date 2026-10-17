@@ -22,11 +22,8 @@ logging_backend: tensorboard  # Set to wandb to use the original online logger.
 eval_dataset: kubric
 movi_f_root: data/event_kubric/train  # Used by the shared Movi-F augmentation base.
 event_kubric_root: data/event_kubric
-event_kubric_val_root: data/event_kubric/val
 split_seed: 1234
 event_kubric_rgb_variant: sharp  # raw/rgba_*.png, never rgba_blur_*.png
-event_kubric_base_val_limit: 32
-event_kubric_val_per_source: 8
 event_kubric_eval_points: 128
 samples_per_epoch: 9000
 num_workers: 4  # Per GPU; the original fixed 32 workers per GPU is excessive here.

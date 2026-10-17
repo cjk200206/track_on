@@ -3,6 +3,7 @@ from model.trackon import Track_On2
 import torch.nn.functional as F
 from utils.coord_utils import get_points_on_a_grid
 from utils.train_utils import load_pretrained_weights
+from model.trajectory_history import trajectory_entry
 
 
 class Predictor(torch.nn.Module):
@@ -15,7 +16,8 @@ class Predictor(torch.nn.Module):
         self.model = Track_On2(model_args)
 
         if checkpoint_path is not None:
-            load_pretrained_weights(self.model, checkpoint_path)
+            allowed = ("trajectory_scorer.",) if self.model.trajectory_scorer is not None else ()
+            load_pretrained_weights(self.model, checkpoint_path, extra_allowed_missing_prefixes=allowed)
 
         # Optional inference-time memory extension
         ime_size = getattr(model_args, "M_i", 72)
@@ -52,6 +54,7 @@ class Predictor(torch.nn.Module):
         """Reset all tracking state to start fresh."""
         self.t = 0
         self.point_memory = None
+        self.trajectory_history = None
         self.temporal_mask = None
         self.q_init = None
         self.N = 0                      # Number of active queries
@@ -107,6 +110,8 @@ class Predictor(torch.nn.Module):
             self.q_init = torch.zeros(self.capacity, D, device=device)
             self.point_memory = torch.zeros(self.capacity, M, D, device=device)
             self.temporal_mask = torch.ones(self.capacity, M, device=device, dtype=torch.bool)
+            if self.model.trajectory_scorer is not None:
+                self.trajectory_history = torch.zeros(self.capacity, M, 4, device=device)
 
             # Fill in the actual data
             self.q_init[:N_new] = q_new
@@ -133,6 +138,10 @@ class Predictor(torch.nn.Module):
                 self.point_memory = new_point_memory
                 self.temporal_mask = new_temporal_mask
                 self.capacity = new_capacity
+                if self.trajectory_history is not None:
+                    new_history = self.trajectory_history.new_zeros(new_capacity, M, 4)
+                    new_history[:self.N] = self.trajectory_history[:self.N]
+                    self.trajectory_history = new_history
 
             # Add new queries using in-place indexing (no concatenation needed)
             self.q_init[self.N:self.N + N_new] = q_new
@@ -169,18 +178,23 @@ class Predictor(torch.nn.Module):
 
         # Track using pre-extracted features (use only active queries)
         frame_features = (f4_t, f8_t, f16_t, f32_t, f_fused_t)
-        p, v_logit, q_new = self.model.track_frame(
+        p, v_logit, q_new, u_logit = self.model.track_frame(
             self.q_init[:self.N],
             self.temporal_mask[:self.N],
             self.point_memory[:self.N],
             frame_features,
             H,
-            W
+            W,
+            trajectory_history=None if self.trajectory_history is None else self.trajectory_history[:self.N],
+            return_uncertainty=True,
         )
 
         # Shift memory left and add new feature at the end (in-place using roll for efficiency)
         self.point_memory[:self.N] = torch.roll(self.point_memory[:self.N], shifts=-1, dims=1)
         self.point_memory[:self.N, -1] = q_new
+        if self.trajectory_history is not None:
+            self.trajectory_history[:self.N] = torch.roll(self.trajectory_history[:self.N], shifts=-1, dims=1)
+            self.trajectory_history[:self.N, -1] = trajectory_entry(p, v_logit, u_logit, (H, W))
         self.temporal_mask[:self.N] = torch.roll(self.temporal_mask[:self.N], shifts=-1, dims=1)
         self.temporal_mask[:self.N, -1] = False
 
@@ -190,7 +204,7 @@ class Predictor(torch.nn.Module):
         self.t += 1
 
         # Clean up intermediate tensors before returning
-        del frame_features, f4_t, f8_t, f16_t, f32_t, f_fused_t, v_logit, q_new
+        del frame_features, f4_t, f8_t, f16_t, f32_t, f_fused_t, v_logit, u_logit, q_new
 
         return p, v_t
 
