@@ -115,9 +115,52 @@ in TAPFormer's configuration. Each dataset's result is the unweighted mean of
 its sequence metrics. Results are written to `output_dir/summary.json`; set
 `save_predictions: true` to also save per-sequence NPZ predictions.
 
+`support_grid_size: S` adds an `S × S` global grid at the first frame (zero
+disables it). Optional `local_support_radius: R` adds the eight neighbors of a
+3 × 3 grid around each original query, with offsets `-R, 0, R` in model-input
+pixels, scaled to the original image. Out-of-bounds neighbors are dropped;
+the default radius is zero. All support points are tracked throughout the
+sequence, while only original queries are scored. JSON sequence rows also
+record the sampling settings, actual support count, and peak allocated CUDA
+memory in MiB.
+
 This RGB evaluation follows the image frame rate. TAPFormer's event-based run
 tracks intermediate event timestamps too, so scores from the two protocols are
 not directly comparable.
+
+### Optional recent and RGB memory for frame/event evaluation
+
+The recurrent, motion/ETAP, and RGB-aligned test configs expose an optional
+inference-only policy. Missing `memory_policy` or `type: fifo` uses the original
+Predictor. To enable the previously tested 24+48 split:
+
+```yaml
+inference_memory_size: 72
+memory_policy:
+  type: recent_rgb
+  recent_size: 24
+  rgb_size: 48
+```
+
+Every update enters the recent queue. Once full, its evicted entry enters the
+older RGB queue only if it was generated at a new RGB timestamp. These are
+fused queries from RGB times, not separately extracted RGB features. Both
+queues are read together, without duplicates; unfilled slots remain masked.
+All queues reset between sequences, and point features, validity masks, and
+optional trajectory history stay synchronized. Training and the base Predictor
+are unchanged.
+
+`recent_size` must be a positive integer; `rgb_size` may be zero. Their sum must
+equal `inference_memory_size`. For example, use 36+36 or 48+24 to compare splits
+at the same total attention width. Changing the total also changes the existing
+time-position embedding interpolation. The policy does not change `event_dt`,
+support points, or RGB-time scoring. In RGB-only evaluation, every step is RGB.
+
+Run the same `evaluation.test_tapformer_real` command with your edited config.
+Use distinct output directories for different policies to preserve results.
+JSON sequence rows record `memory_policy` and `inference_memory_size`; CSV rows
+also include `memory_policy`, `recent_memory_size`, `rgb_memory_size`, and
+`inference_memory_size` for both sequences and dataset means.
 
 ### EDS and EC feature tracking
 

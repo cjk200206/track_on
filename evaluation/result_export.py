@@ -14,14 +14,17 @@ TAPVID_CSV_COLUMNS = {
 FEATURE_CSV_COLUMNS = {"mean_error": "mean_error_px", "fa": "fa", "efa": "efa"}
 
 
-def write_summary_csv(results, path, metric_columns, metric_scale=1.0, checkpoint="", model="trackon2"):
+def write_summary_csv(results, path, metric_columns, metric_scale=1.0, checkpoint="", model="trackon2",
+                      metadata=None):
     """Write sequence rows plus an unweighted dataset mean row.
 
     `metric_columns` maps JSON metric keys to explicit CSV column names.
+    Optional `metadata` adds constant columns to sequence and dataset-mean rows.
     """
+    metadata = metadata or {}
     fieldnames = [
         "model", "checkpoint", "dataset", "row_type", "sequence", "sequence_count", "frames", "event_steps", "event_dt", "points",
-        "seconds_per_frame", "video_path", "preview_path", *metric_columns.values(),
+        "seconds_per_frame", "video_path", "preview_path", *metric_columns.values(), *metadata,
     ]
     with open(path, "w", newline="", encoding="utf-8-sig") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames)
@@ -30,6 +33,7 @@ def write_summary_csv(results, path, metric_columns, metric_scale=1.0, checkpoin
             sequences = data["sequences"]
             for item in sequences:
                 row = {
+                    **metadata,
                     "model": model,
                     "checkpoint": checkpoint,
                     "dataset": dataset,
@@ -47,6 +51,7 @@ def write_summary_csv(results, path, metric_columns, metric_scale=1.0, checkpoin
                             for key, column in metric_columns.items()})
                 writer.writerow(row)
             average = {
+                **metadata,
                 "model": model,
                 "checkpoint": checkpoint,
                 "dataset": dataset,

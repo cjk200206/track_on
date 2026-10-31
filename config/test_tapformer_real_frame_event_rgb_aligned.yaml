@@ -32,6 +32,11 @@ event_dt:
 drivtap_gt_mode: downsample_even
 support_grid_size: 20
 inference_memory_size: 72
+# Opt in with recent_rgb; sizes must sum to inference_memory_size.
+memory_policy:
+  type: fifo
+  recent_size: 24
+  rgb_size: 48
 device: auto
 amp: true
 save_predictions: false

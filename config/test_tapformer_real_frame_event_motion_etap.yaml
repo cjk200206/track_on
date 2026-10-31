@@ -2,9 +2,12 @@
 # Paths are relative to the Track-On2 repository root.
 dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
 input_mode: frame_event
-model_config: config/train_frame_event_motion_etap_new.yaml
-checkpoint: outputs/frame_event_motion_etap_new/20261007_151640/best.pt
-output_dir: outputs/real_tapformer_frame_event_motion_etap_20261007
+# model_config: config/train_frame_event_motion_etap_new.yaml
+model_config: config/train_frame_event_spatial_aug.yaml
+# checkpoint: outputs/frame_event_motion_etap_new/20261007_151640/best.pt
+# output_dir: outputs/real_tapformer_frame_event_motion_etap_20261007
+checkpoint: outputs/frame_event_spatial_aug/20261019_195452/best.pt
+output_dir: outputs/real_tapformer_frame_event_motion_etap_spatial_aug/20261019
 csv_filename: summary.csv
 
 sequences:
@@ -29,7 +32,13 @@ event_dt:
   DrivTAP: "0.0100"
 drivtap_gt_mode: downsample_even
 support_grid_size: 20
+local_support_radius: 0
 inference_memory_size: 72
+# Opt in with recent_rgb; sizes must sum to inference_memory_size.
+memory_policy:
+  type: fifo
+  recent_size: 24
+  rgb_size: 48
 device: auto
 amp: true
 save_predictions: false

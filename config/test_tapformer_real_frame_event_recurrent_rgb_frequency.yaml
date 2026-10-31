@@ -1,0 +1,57 @@
+# Based on test_tapformer_real_frame_event_recurrent.yaml.
+# Match TAPFormer's rgb_frequency_20261028 caches, GT, resolution and support grid.
+# Run from the repository root; repeat with K=1,2,4,8 (outputs use kK subdirectories):
+# CUDA_VISIBLE_DEVICES=0 python -m evaluation.test_tapformer_real --config config/test_tapformer_real_frame_event_recurrent_rgb_frequency.yaml --rgb-keep-every 1
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+input_mode: frame_event
+model_config: outputs/frame_event_recurrent/20261019_195720/run_config.json
+checkpoint: outputs/frame_event_recurrent/20261019_195720/last.pt  # Epoch 96, step 36096; no exposure fine-tuning.
+output_dir: outputs/recurrent_rgb_frequency_20261028
+csv_filename: summary.csv
+rgb_keep_every: 1
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+# Explicitly reuse the same existing cache directories for every K and both models.
+# These are the legacy caches, not the repaired continuous RGB-aligned caches.
+event_dt:
+  InivTAP:
+    ID_Fast_Fruit: "0.0100"
+    ID_Dark_Fruit: "0.0300"
+    ID_OverExp_Fruit: "0.0200"
+    ID_OverExp_Fruit2: "0.0200"
+    ID_Dynamic_Robot: "0.0200"
+    OD_Dynamic: "0.0500"
+    OD_Static: "0.0500"
+    OD_Basketball: "0.0150"
+  DrivTAP: "0.0030"
+drivtap_gt_mode: downsample_even
+support_grid_size: 0
+local_support_radius: 0
+
+inference_memory_size: 72
+memory_policy:
+  type: recent_rgb
+  recent_size: 24
+  rgb_size: 48
+device: auto
+amp: true
+# Metrics and grouped scores are saved; avoid extra prediction arrays and videos.
+save_predictions: false
+visualization:
+  enabled: false

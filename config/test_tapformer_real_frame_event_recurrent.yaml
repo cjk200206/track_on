@@ -1,0 +1,51 @@
+# Evaluate motion_state + ETAP at every event step, scoring RGB timestamps.
+# Paths are relative to the Track-On2 repository root.
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+input_mode: frame_event
+model_config: config/train_frame_event_recurrent.yaml 
+# checkpoint: outputs/frame_event_recurrent/20261019_195720/best.pt
+# output_dir: outputs/real_tapformer_frame_event_recurrent/20261019_24_48_local_8
+checkpoint: outputs/frame_event_recurrent_exposure_finetune/20261027_114511/last.pt
+output_dir: outputs/real_tapformer_frame_event_recurrent_exposure_ft/20261019_24_48
+csv_filename: summary.csv
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+event_dt:
+  InivTAP: auto       # Each sequence has one numeric time-surface cache.
+  DrivTAP: "0.0100"
+drivtap_gt_mode: downsample_even
+support_grid_size: 20
+local_support_radius: 0
+
+inference_memory_size: 72
+# Opt in with recent_rgb; sizes must sum to inference_memory_size.
+memory_policy:
+  type: recent_rgb # recent_rgb, fifo
+  recent_size: 24
+  rgb_size: 48
+device: auto
+amp: true
+save_predictions: false
+
+visualization:
+  enabled: true
+  format: mp4          # H.264; webm is also available for VS Code compatibility.
+  fps: 10
+  trail_length: 8
+  max_width: 960
