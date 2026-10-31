@@ -1,0 +1,39 @@
+# Paths are relative to the Track-On2 repository root.
+# Reuse the RGB evaluation protocol with the trained history-candidate backend.
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+model_config: config/train_trackon2_history_candidates.yaml
+checkpoint: outputs/trackon2_history_candidates_scratch/20261024_121153/last.pt
+output_dir: outputs/real_tapformer_trackon2_history_candidates/20261024
+csv_filename: summary.csv
+input_mode: rgb
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+drivtap_gt_mode: downsample_even
+support_grid_size: 20
+inference_memory_size: 72
+device: auto
+amp: true
+save_predictions: true
+
+visualization:
+  enabled: true
+  format: mp4
+  fps: 10
+  trail_length: 8
+  max_width: 960

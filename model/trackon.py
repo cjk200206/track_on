@@ -12,6 +12,7 @@ from model.modules import MHA_Block, SimpleFPN
 from model.prediction_head import Prediction_Head
 from model.reranking import Rerank_Module
 from model.trajectory_history import TrajectoryHistoryScorer, trajectory_entry
+from model.candidate_history import CandidateHistoryScorer
 
 from utils.coord_utils import indices_to_coords
 
@@ -68,6 +69,51 @@ class Track_On2(nn.Module):
         self.t_embedding = nn.Parameter(torch.zeros(1, self.M + 1, self.D))
         nn.init.trunc_normal_(self.t_embedding, std=0.02)
         # === === ===
+
+        self.candidate_scorer = None
+        self.memory_reliability = None
+        if getattr(args, "history_candidate_scoring", False):
+            if self.trajectory_scorer is not None:
+                raise ValueError("history_candidate_scoring replaces the optional trajectory scorer")
+            self.candidate_scorer = CandidateHistoryScorer(
+                self.D, self.input_size,
+                hidden_dim=int(getattr(args, "candidate_score_dim", 64)),
+                num_layers=int(getattr(args, "candidate_score_layers", 2)), num_heads=nhead)
+            self.memory_reliability = nn.Linear(2, nhead)
+            nn.init.zeros_(self.memory_reliability.weight)
+            nn.init.zeros_(self.memory_reliability.bias)
+        self.uses_history = self.trajectory_scorer is not None or self.candidate_scorer is not None
+
+    def _memory_bias(self, history):
+        if self.memory_reliability is None:
+            return None
+        if history is None:
+            raise ValueError("history_candidate_scoring requires synchronized xy/v/u history")
+        bias = self.memory_reliability(history[..., 2:].detach()).transpose(1, 2)
+        return F.pad(bias, (0, 1))  # The current query has no reliability bias.
+
+    def _predict_position(self, q, features, patches, rerank_scores, memory, history, mask):
+        """Share localization between training, online and streaming inference."""
+        if self.candidate_scorer is None:
+            c2 = self.multiscale_correlation(q, *features, trajectory_history=history,
+                                            temporal_mask=mask, stage=1)
+            patch = indices_to_coords(c2.detach().argmax(-1).unsqueeze(1),
+                                     self.input_size, self.stride).squeeze(1)
+            offsets, visibility, uncertainty = self.prediction_head(q, *features, patch)
+            return patch, offsets, visibility, uncertainty, c2, None
+
+        offsets, visibility, uncertainty = self.prediction_head(q, *features, patches)
+        positions = patches[0] + offsets[-1]
+        scores = self.candidate_scorer(positions, features, memory, history, mask, self.t_embedding)
+        # Initialization uses the already supervised reranking head, not empty tokens.
+        scores = torch.where(mask.all(-1, keepdim=True), rerank_scores[0], scores)
+        best = scores.detach().argmax(-1)
+        points = torch.arange(q.shape[1], device=q.device)
+        patch = patches[:, points, best]
+        selected_offsets = offsets[:, points, best]
+        candidates = {"O_candidates": offsets, "S_candidates": scores,
+                      "P_candidates": positions}
+        return patch, selected_offsets, visibility, uncertainty, None, candidates
 
     def _backbone_features(self, video, events=None, img_ifnew=None, frontend_state=None):
         """Keep event arguments out of the RGB backbone's interface."""
@@ -200,12 +246,12 @@ class Track_On2(nn.Module):
         point_memory = torch.zeros(B, N, M, D, device=device)                             # (B, N, M, D)
         temporal_mask = torch.ones(B, N, M, device=device, dtype=torch.bool)              # True if masked, (B, N, M)
         trajectory_history = (torch.zeros(B, N, M, 4, device=device)
-                              if self.trajectory_scorer is not None else None)
+                              if self.uses_history else None)
         # === === ===
 
         # === Output initialization ===
         C1 = torch.zeros(B, T, N, self.P, device=device)                        # (B, T, N, P)
-        C2 = torch.zeros(B, T, N, self.P, device=device)                        # (B, T, N, P)
+        C2 = torch.zeros(B, T, N, self.P, device=device) if self.candidate_scorer is None else None
         O = torch.zeros(B, T, layer_num_pred_head, N, 2, device=device)         # (B, layer_num_pred_head, T, N, 2)
 
         V_logit = torch.zeros(B, T, N, device=device)      # (B, T, N)
@@ -216,6 +262,13 @@ class Track_On2(nn.Module):
         U_logit_top_k = torch.zeros(B, T, N, K, device=device)                  # (B, T, N, K)
         S_logit_top_k = torch.zeros(B, T, N, K, device=device)                  # (B, T, N, K)
         P_patch_top_k = torch.zeros(B, T, N, K, 2, device=device)               # (B, T, N, K, 2)
+        candidate_outputs = {}
+        if self.candidate_scorer is not None:
+            candidate_outputs = {
+                "O_candidates": torch.zeros(B, T, layer_num_pred_head, N, K, 2, device=device),
+                "S_candidates": torch.zeros(B, T, N, K, device=device),
+                "P_candidates": torch.zeros(B, T, N, K, 2, device=device),
+            }
         # === === ===
 
         for t in range(T):
@@ -230,6 +283,7 @@ class Track_On2(nn.Module):
                 memory_mask_t = temporal_mask[b, available_queries]                # (N_t, M)
                 history_t = None if trajectory_history is None else trajectory_history[b, available_queries]
                 memory = point_memory[b, available_queries].clone()              # (N_t, M, D)
+                memory_bias = self._memory_bias(history_t)
                 
                 q_t = query_init[b, available_queries].clone().unsqueeze(0)      # (1, N_t, D)
 
@@ -258,7 +312,8 @@ class Track_On2(nn.Module):
                     mask = torch.cat([memory_mask_noised, torch.zeros(N_t, 1, device=device).bool()], dim=1)        # (N_t, M + 1)
 
 
-                    qkv = self.memory_attention[i](qkv + self.t_embedding, qkv + self.t_embedding, qkv, mask)                           # (N_t, M + 1, D)
+                    qkv = self.memory_attention[i](qkv + self.t_embedding, qkv + self.t_embedding,
+                                                  qkv, mask, attention_bias=memory_bias)
 
                     q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N_t, D)
                     memory = qkv[:, :-1]                                            # (N_t, M, D)
@@ -273,19 +328,18 @@ class Track_On2(nn.Module):
 
                 q_t, p_patch_top_k, u_logit_top_k, s_logit_top_k = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)  # (1, N_t, D), (1, N_t, K, 2), (1, N_t, K), (1, N_t, K)
                 q_t = self.projection2(q_t)                                                             # (1, N_t, D)
-                c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
-                                                 trajectory_history=history_t, temporal_mask=memory_mask_t, stage=1)
-
-                p_patch = indices_to_coords(torch.argmax(c2.detach(), dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N_t, 2), in range [H, W]
-                p_patch = p_patch.squeeze(1)                                                                               # (1, N_t, 2)
-                # === === ===
-
-                # === Prediction Head ===
-                o, v_logit, u_logit = self.prediction_head(q_t, f4_t, f8_t, f16_t, f32_t, p_patch)        # (layer_num, N_t, 2), (N_t), (N_t)
+                p_patch, o, v_logit, u_logit, c2, candidates = self._predict_position(
+                    q_t, (f4_t, f8_t, f16_t, f32_t), p_patch_top_k, s_logit_top_k,
+                    point_memory[b, available_queries].clone(), history_t, memory_mask_t)
                 # === === ===
 
                 C1[b, t, available_queries] = c1.squeeze(0).float()         # (1, N_t, P) 
-                C2[b, t, available_queries] = c2.squeeze(0).float()         # (1, N_t, P)
+                if C2 is not None:
+                    C2[b, t, available_queries] = c2.squeeze(0).float()
+                if candidates is not None:
+                    candidate_outputs["O_candidates"][b, t, :, available_queries] = candidates["O_candidates"].float()
+                    candidate_outputs["S_candidates"][b, t, available_queries] = candidates["S_candidates"].float()
+                    candidate_outputs["P_candidates"][b, t, available_queries] = candidates["P_candidates"].float()
                 O[b, t, :, available_queries] = o.float()                                        # (N, 2)
                 V_logit[b, t, available_queries] = v_logit.float()                # (N)
                 U_logit[b, t, available_queries] = u_logit.float()                # (N)
@@ -318,11 +372,14 @@ class Track_On2(nn.Module):
 
         # === Output ===
         # disctionary
-        out = {"P": P, 
-                "C1": C1, "C2": C2, "O": O,
+        out = {"P": P,
+                "C1": C1, "O": O,
                 "V_logit": V_logit, "U_logit": U_logit, 
                 "P_patch": P_patch, 
                 "U_logit_top_k": U_logit_top_k, "S_logit_top_k": S_logit_top_k, "P_patch_top_k": P_patch_top_k}
+        if C2 is not None:
+            out["C2"] = C2
+        out.update(candidate_outputs)
         
 
         return out
@@ -357,7 +414,7 @@ class Track_On2(nn.Module):
         point_memory = torch.zeros(B, N, M, D, device=device)                             # (B, N, M, D)
         temporal_mask = torch.ones(B, N, M, device=device, dtype=torch.bool)              # True if masked, (B, N, M)
         trajectory_history = (torch.zeros(B, N, M, 4, device=device)
-                              if self.trajectory_scorer is not None else None)
+                              if self.uses_history else None)
         # === === ===
 
         # === Output initialization ===
@@ -378,6 +435,7 @@ class Track_On2(nn.Module):
                 memory_mask_t = temporal_mask[b, available_queries]                # (N_t, M)
                 history_t = None if trajectory_history is None else trajectory_history[b, available_queries]
                 memory = point_memory[b, available_queries].clone()                # (N_t, M, D)
+                memory_bias = self._memory_bias(history_t)
 
                 # === Visual Backbone Feedforward ===
                 f4_t, f8_t, f16_t, f32_t = self._backbone_features(video[b, t].unsqueeze(0).unsqueeze(0))     # (1, 1, P, D), (1, 1, P // 4, D), (1, 1, P // 16, D), (1, 1, P // 64, D)
@@ -427,7 +485,7 @@ class Track_On2(nn.Module):
                     qkv = self.memory_attention[i](qkv + self.t_embedding,
                                                     qkv + self.t_embedding,
                                                     qkv,
-                                                    mask)                           # (N_t, M + 1, D)
+                                                    mask, attention_bias=memory_bias)
                     q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N_t, D)
                     memory = qkv[:, :-1]                                            # (N_t, M, D)
                     # === === ===
@@ -438,17 +496,12 @@ class Track_On2(nn.Module):
                 # === Re-ranking ===
                 c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
                                                  trajectory_history=history_t, temporal_mask=memory_mask_t, stage=0)
-                q_t, _, _, _ = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)  # (1, N_t, D), (1, N_t, K, 2), (1, N_t, K), (1, N_t, K)
+                q_t, p_patch_top_k, _, s_logit_top_k = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)
                 q_t = self.projection2(q_t)                                                            # (1, N_t, D)
 
-                c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
-                                                 trajectory_history=history_t, temporal_mask=memory_mask_t, stage=1)
-                p_patch = indices_to_coords(torch.argmax(c2.detach(), dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N_t, 2), in range [H, W]
-                p_patch = p_patch.squeeze(1)                                                                               # (1, N_t, 2)
-                # === === ===
-
-                # === Prediction Head ===
-                o, v_logit, u_logit = self.prediction_head(q_t, f4_t, f8_t, f16_t, f32_t, p_patch)        # (layer_num, N_t, 2), (N_t), (N_t)
+                p_patch, o, v_logit, u_logit, _, _ = self._predict_position(
+                    q_t, (f4_t, f8_t, f16_t, f32_t), p_patch_top_k, s_logit_top_k,
+                    point_memory[b, available_queries].clone(), history_t, memory_mask_t)
                 # === === ===
 
                 P[b, t, available_queries] = p_patch[0] + o[-1]                   # (1, N_t, 2)
@@ -546,6 +599,7 @@ class Track_On2(nn.Module):
         memory_mask_t = temporal_mask.clone()              # (N, M)
         memory = point_memory.clone()                      # (N, M, D)
         history_t = trajectory_history
+        memory_bias = self._memory_bias(history_t)
 
         # === Query Decoder ===
         # Pre-allocate buffers for efficiency
@@ -573,7 +627,7 @@ class Track_On2(nn.Module):
             qkv = self.memory_attention[i](qkv + self.t_embedding,
                                             qkv + self.t_embedding,
                                             qkv,
-                                            mask)                           # (N, M + 1, D)
+                                            mask, attention_bias=memory_bias)
             q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N, D)
             qkv[:, :-1] = qkv[:, :-1].clone()  # Preserve memory for next iteration
             # === === ===
@@ -584,17 +638,12 @@ class Track_On2(nn.Module):
         # === Re-ranking ===
         c1 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
                                          trajectory_history=history_t, temporal_mask=memory_mask_t, stage=0)
-        q_t, _, _, _ = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)  # (1, N, D), (1, N, K, 2), (1, N, K), (1, N, K)
+        q_t, p_patch_top_k, _, s_logit_top_k = self.reranking_head(q_t, f4_t, f8_t, f16_t, f32_t, c1)
         q_t = self.projection2(q_t)                                                            # (1, N, D)
 
-        c2 = self.multiscale_correlation(q_t, f4_t, f8_t, f16_t, f32_t,
-                                         trajectory_history=history_t, temporal_mask=memory_mask_t, stage=1)
-        p_patch = indices_to_coords(torch.argmax(c2, dim=-1).unsqueeze(1), self.input_size, self.stride)   # (1, 1, N, 2), in range [H, W]
-        p_patch = p_patch.squeeze(1)                                                                               # (1, N, 2)
-        # === === ===
-
-        # === Prediction Head ===
-        o, v_logit, u_logit = self.prediction_head(q_t, f4_t, f8_t, f16_t, f32_t, p_patch)        # (layer_num, N, 2), (N), (N)
+        p_patch, o, v_logit, u_logit, _, _ = self._predict_position(
+            q_t, (f4_t, f8_t, f16_t, f32_t), p_patch_top_k, s_logit_top_k,
+            point_memory, history_t, memory_mask_t)
         # === === ===
 
         # === Final predictions (point_mechanism='a') ===

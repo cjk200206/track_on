@@ -1,0 +1,86 @@
+# RGB fine-tuning of the multi-candidate history backend from official weights.
+# Existing eight-source RGB data/splits are copied from train_trackon2_kubric_panning.yaml.
+# Train the backend and adapter; the existing DINO encoder remains frozen.
+# Six GPUs x batch 1 x accumulation 4 = effective batch 24, 6,016 updates in 16 epochs.
+# For 8 GPUs use accumulation 3; for 1 GPU use accumulation 24 to keep the same budget.
+# N=192, T=24, K=16; full-clip memory has not yet been measured.
+# If needed, reduce N first, keeping T/M/K fixed. Do not resume an old-backend checkpoint.
+event_kubric_sources:
+- name: train_batch
+  weight: 24
+  val_fraction: 0.1
+- name: train_seq
+  weight: 24
+  val_fraction: 0.1
+- name: train_batch_panning
+  weight: 16
+  val_fraction: 0.1
+- name: train_seq_panning
+  weight: 16
+  val_fraction: 0.1
+- name: fast_batch
+  weight: 6
+  val_fraction: 0.1
+- name: fast_seq
+  weight: 6
+  val_fraction: 0.1
+- name: fast_batch_panning
+  weight: 4
+  val_fraction: 0.1
+- name: fast_seq_panning
+  weight: 4
+  val_fraction: 0.1
+train_dataset: event_kubric_rgb
+logging_backend: tensorboard
+eval_dataset: kubric
+movi_f_root: data/event_kubric
+event_kubric_root: data/event_kubric
+split_seed: 1234
+event_kubric_rgb_variant: sharp
+event_kubric_eval_points: 128
+samples_per_epoch: 9024
+num_workers: 8
+val_num_workers: 4
+eval_every_epochs: 1
+best_metric: aj
+save_every: 1
+checkpoint_path: null
+model_save_path: outputs/trackon2_history_candidates
+frame_sampling: uniform
+frame_sample_ratio: 2.0
+input_size:
+- 384
+- 512
+N: 160
+T: 24
+M: 24
+D: 256
+K: 8
+# K: 8
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+M_i: 72
+delta_v: 0.8
+lambda_patch_cls: 3.0
+evaluation: true
+epoch_num: 12
+lr: 5.0e-05
+warmup_ratio: 0.05
+wd: 1.0e-05
+bs: 1
+grad_accum_steps: 4
+grad_checkpoint: true
+amp: true
+seed: 1234
+init_checkpoint_path: checkpoints/trackon2_dinov3_checkpoint.pt
+history_candidate_scoring: true
+candidate_score_dim: 64
+candidate_score_layers: 2
+candidate_target_sigma: 4.0
+candidate_coverage_radius: 8.0
+trajectory_history_size: 0
+train_trajectory_scorer_only: false

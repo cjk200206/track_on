@@ -30,6 +30,11 @@ def get_args():
     parser.add_argument('--decoder_layer_num', type=int, default=3, help="Number of layers in query/point decoder")
     parser.add_argument('--predicton_head_layer_num', type=int, default=3, help="Number of layers in prediction head")
     parser.add_argument('--rerank_layer_num', type=int, default=3, help="Number of layers in reranking")
+    parser.add_argument('--history_candidate_scoring', action='store_true', help="Refine C1 candidates and replace C2 with history scoring")
+    parser.add_argument('--candidate_score_dim', type=int, default=64)
+    parser.add_argument('--candidate_score_layers', type=int, default=2)
+    parser.add_argument('--candidate_target_sigma', type=float, default=4.0, help="Soft target distance scale in input pixels")
+    parser.add_argument('--candidate_coverage_radius', type=float, default=8.0, help="Skip scoring supervision when all candidates exceed this input-pixel error")
 
     parser.add_argument('--vit_backbone', type=str, choices=["dinov2_s", "dinov2_b", "dinov3_s", "dinov3_s_plus", "dinov3_b"], default="dinov2_s", help="Type of ViT backbone of ViT Adapter")
     parser.add_argument('--vit_upsample_factor', type=float, default=1.0, help="Upsample factor for ViT inputs")

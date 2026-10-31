@@ -418,6 +418,8 @@ def build_training_model(args):
     # Resuming restores the complete training state below and takes precedence.
     if init_checkpoint and args.checkpoint_path is None:
         allowed = ("trajectory_scorer.",) if model.trajectory_scorer is not None else ()
+        if getattr(args, "history_candidate_scoring", False):
+            allowed += ("candidate_scorer.", "memory_reliability.")
         load_pretrained_weights(model, init_checkpoint, extra_allowed_missing_prefixes=allowed)
         print("Initialized model weights for a new training run; optimizer and progress start fresh.")
     if getattr(args, "train_trajectory_scorer_only", False):

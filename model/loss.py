@@ -17,6 +17,10 @@ class Loss_Function(nn.Module):
         self.epsilon_smoothing = 0.0
         self.lambda_patch_cls = args.lambda_patch_cls
         self.temperature = 0.05
+        self.candidate_target_sigma = float(getattr(args, "candidate_target_sigma", 4.0))
+        self.candidate_coverage_radius = float(getattr(args, "candidate_coverage_radius", 8.0))
+        if self.candidate_target_sigma <= 0 or self.candidate_coverage_radius <= 0:
+            raise ValueError("Candidate target sigma and coverage radius must be positive")
 
 
     def forward(self, out, gt_tracks, gt_visibility, query_times):
@@ -40,7 +44,7 @@ class Loss_Function(nn.Module):
 
         B, T, N, _ = gt_tracks.shape
         C1 = out["C1"]                                          # (B, T, N, P)
-        C2 = out["C2"]                                          # (B, T, N, P)
+        multi_candidate = "S_candidates" in out
         O = out["O"]                                            # (B, T, #layers, N, 2)
         V = out["V_logit"]                                   # (B, T, #layers, N)
         U = out["U_logit"]                                   # (B, T, #layers, N)
@@ -56,19 +60,28 @@ class Loss_Function(nn.Module):
 
         # === Point Loss ===
         L_p = self.patch_classification_loss(C1, gt_tracks, gt_visibility, query_times)        # (B * T * N)
-        L_p2 = self.patch_classification_loss(C2, gt_tracks, gt_visibility, query_times)       # (B * T * N)
+        if multi_candidate:
+            L_p2 = self.candidate_score_loss(out["S_candidates"], out["P_candidates"],
+                                             gt_tracks, gt_visibility, query_times)
+        else:
+            L_p2 = self.patch_classification_loss(out["C2"], gt_tracks, gt_visibility, query_times)
 
         # == Offset Loss ===
         L_o = 0
         for i in range(layer_num_pred_head):
-            L_o += self.offset_loss(O[:, :, i], P_patch, gt_tracks, gt_visibility, query_times)
+            if multi_candidate:
+                L_o += self.candidate_offset_loss(out["O_candidates"][:, :, i], P_patch_top_k,
+                                                  gt_tracks, gt_visibility, query_times)
+            else:
+                L_o += self.offset_loss(O[:, :, i], P_patch, gt_tracks, gt_visibility, query_times)
         L_o /= layer_num_pred_head
                                
         # === Visibility Loss ===
         L_vis = self.visibility_loss(V, gt_visibility, query_times)
 
         # === Uncertainty Loss ===
-        L_u = self.uncertainty_loss(U, P_patch, gt_tracks, gt_visibility, query_times)
+        point_pred = P_patch + O[:, :, -1] if multi_candidate else P_patch
+        L_u = self.uncertainty_loss(U, point_pred.detach(), gt_tracks, gt_visibility, query_times)
 
         # === Top-K Uncertainty ===
         L_topk_u = 0
@@ -79,6 +92,31 @@ class Loss_Function(nn.Module):
         L_topk_rank = self.region_rank_loss(S_top_k, P_patch_top_k, gt_tracks, gt_visibility, query_times)
 
         return L_p, L_p2, L_vis, L_o, L_u, L_topk_u, L_topk_rank
+
+    def candidate_score_loss(self, scores, positions, gt_tracks, gt_visibility, query_times):
+        # Targets are relative matching quality, not calibrated correctness probabilities.
+        mask, _ = self.get_masks(gt_visibility, query_times)
+        squared_error = (positions.detach().float() - gt_tracks[..., None, :].float()).square().sum(-1)
+        covered = squared_error.min(-1).values <= self.candidate_coverage_radius ** 2
+        height, width = self.size
+        in_bounds = ((gt_tracks >= 0) & (gt_tracks < gt_tracks.new_tensor([width, height]))).all(-1)
+        mask = mask.reshape_as(covered) * covered * in_bounds
+        targets = F.softmax(-squared_error / self.candidate_target_sigma ** 2, dim=-1)
+        loss = -(targets * F.log_softmax(scores.float(), dim=-1)).sum(-1)
+        return self.lambda_patch_cls * (loss * mask).sum() / mask.sum().clamp_min(1)
+
+    def candidate_offset_loss(self, offsets, patches, gt_tracks, gt_visibility, query_times):
+        mask, _ = self.get_masks(gt_visibility, query_times)
+        target = gt_tracks[..., None, :] - patches
+        # Tanh offsets cannot move a remote patch onto the target.
+        reachable = (target.abs() < self.stride).all(-1)
+        height, width = self.size
+        in_bounds = ((gt_tracks >= 0) & (gt_tracks < gt_tracks.new_tensor([width, height]))).all(-1)
+        valid = reachable & mask.reshape_as(gt_visibility).bool()[..., None] & in_bounds[..., None]
+        count = valid.sum(-1)
+        loss = F.l1_loss(offsets.float(), target.float(), reduction="none").sum(-1)
+        per_point = (loss * valid).sum(-1) / count.clamp_min(1)
+        return per_point.sum() / (count > 0).sum().clamp_min(1)
 
 
     def get_gt_offset(self, gt_tracks, stride, p_t):
@@ -134,7 +172,7 @@ class Loss_Function(nn.Module):
         L_p = F.cross_entropy(p_t / self.temperature, gt_indices.long(), reduction="none", 
                               label_smoothing=self.epsilon_smoothing)                # (B * T * N)
         L_p = L_p * mask_point                                                       # (B * T * N)
-        L_p = L_p.sum() / mask_point.sum()
+        L_p = L_p.sum() / mask_point.sum().clamp_min(1)
 
         L_p *= self.lambda_patch_cls
 
@@ -155,7 +193,7 @@ class Loss_Function(nn.Module):
         L_vis = F.binary_cross_entropy_with_logits(V_t.float(), gt_visibility.float(), reduction="none")    # (B, T, N)
         L_vis = L_vis.reshape(B * T * N)                                                   # (B * T * N)
         L_vis = L_vis * mask_visible                                                   # (B * T * N)
-        L_vis = L_vis.sum() / mask_visible.sum()
+        L_vis = L_vis.sum() / mask_visible.sum().clamp_min(1)
 
         return L_vis
     
@@ -179,7 +217,7 @@ class Loss_Function(nn.Module):
         L_offset = L_offset.sum(dim=-1).view(-1)                          # (B * T * N)
         L_offset = L_offset * mask_point                                  # (B * T * N)
         L_offset = torch.clamp(L_offset, min=0, max=2 * self.stride)
-        L_offset = L_offset.sum() / mask_point.sum()
+        L_offset = L_offset.sum() / mask_point.sum().clamp_min(1)
 
         return L_offset
 
@@ -208,7 +246,7 @@ class Loss_Function(nn.Module):
                                                    reduction="none")     # (B, T, N)
         L_unc = L_unc.view(B * T * N)                                               # (B * T * N)
         L_unc = L_unc * loss_mask                                                   # (B * T * N)
-        L_unc = L_unc.sum() / loss_mask.sum()
+        L_unc = L_unc.sum() / loss_mask.sum().clamp_min(1)
 
         return L_unc
     
@@ -236,5 +274,5 @@ class Loss_Function(nn.Module):
 
         L_rank = F.cross_entropy(S_top_k.float(), best_indices.long(), reduction="none")  # (B * T * N)
         L_rank = L_rank * mask_point
-        L_rank = L_rank.sum() / mask_point.sum()
+        L_rank = L_rank.sum() / mask_point.sum().clamp_min(1)
         return L_rank

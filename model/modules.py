@@ -32,7 +32,7 @@ class MHA_Block(nn.Module):
 
         self.act = nn.ReLU(inplace=True)
 
-    def forward(self, q, k, v, mask=None):
+    def forward(self, q, k, v, mask=None, attention_bias=None):
         # q, k, v: (B, T, C), mask: (B, P), where True = ignore
         B, N, C = q.shape
         _, P, _ = k.shape
@@ -42,7 +42,17 @@ class MHA_Block(nn.Module):
             full_mask = mask.all(dim=1)  # (B,)
 
         q_orig = q
-        attn_out, _ = self.mha(q, k, v, key_padding_mask=mask, need_weights=False)
+        attn_mask = None
+        padding_mask = mask
+        if attention_bias is not None:
+            # Per-head key bias, shared by all query rows; invalid slots stay masked.
+            attn_mask = attention_bias.to(q.dtype).unsqueeze(2).expand(B, self.num_heads, N, P)
+            if mask is not None:
+                attn_mask = attn_mask.masked_fill(mask[:, None, None], float("-inf"))
+            attn_mask = attn_mask.reshape(B * self.num_heads, N, P)
+            padding_mask = None
+        attn_out, _ = self.mha(q, k, v, key_padding_mask=padding_mask,
+                               attn_mask=attn_mask, need_weights=False)
 
         drop = self.dropout1(attn_out)
 

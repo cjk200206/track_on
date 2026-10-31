@@ -63,7 +63,7 @@ class Prediction_Head(nn.Module):
         # :args f8: (1, P // 4, D)
         # :args f16: (1, P // 16, D)
         # :args f32: (1, P // 32, D)
-        # :args target_coordinates: (1, N, 2), in size range
+        # :args target_coordinates: (1, N, 2) or (1, N, K, 2), in input pixels
         #
         # :return o_t: (#layers, N, 2)
         # :return v_logit: (N), visibility logits
@@ -72,6 +72,11 @@ class Prediction_Head(nn.Module):
         _, N, D = q_t.shape
         device = q_t.device
         layer_num = self.layer_num
+        target_shape = target_coordinates.shape[1:-1]
+        q_t_init = q_t.clone()
+        if target_coordinates.ndim == 4:
+            q_t = q_t[:, :, None].expand(-1, -1, target_shape[1], -1).reshape(1, -1, D)
+        target_coordinates = target_coordinates.reshape(1, -1, 2)
 
         # Scale the target coordinates to [0, 1] range    
         target_coordinates = target_coordinates / torch.tensor([self.size[1], self.size[0]], device=device)  # (1, N, 2)
@@ -80,10 +85,9 @@ class Prediction_Head(nn.Module):
 
         f_scales = torch.cat([h4, h8, h16, h32], dim=1)          # (1, P + P // 4 + P // 16 + P // 64, D)
 
-        q_t_init = q_t.clone()                             # (1, N, D)
         q_t_offset = q_t.clone()                           # (1, N, D)
 
-        o_t = torch.zeros((layer_num, N, 2), device=device) 
+        o_t = torch.zeros((layer_num, *target_shape, 2), device=device)
 
         for i in range(self.layer_num):
             q_t_offset = self.offset_transformer[i](q=q_t_offset, k=f_scales, v=f_scales, 
@@ -92,7 +96,7 @@ class Prediction_Head(nn.Module):
                                                     start_levels=self.start_levels)
 
             o_t_i = self.offset_layer(q_t_offset).squeeze(0) * self.stride      # (N, 2), in (-stride, stride), in pixel space
-            o_t[i] = o_t_i
+            o_t[i] = o_t_i.reshape(*target_shape, 2)
 
         v_logit = self.vis_layer(q_t_init).squeeze(-1).squeeze(0)   # (N), visibility logits
         u_logit = self.unc_layer(q_t_init).squeeze(-1).squeeze(0)   # (N), uncertainty logits

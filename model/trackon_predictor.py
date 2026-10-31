@@ -110,7 +110,7 @@ class Predictor(torch.nn.Module):
             self.q_init = torch.zeros(self.capacity, D, device=device)
             self.point_memory = torch.zeros(self.capacity, M, D, device=device)
             self.temporal_mask = torch.ones(self.capacity, M, device=device, dtype=torch.bool)
-            if self.model.trajectory_scorer is not None:
+            if self.model.uses_history:
                 self.trajectory_history = torch.zeros(self.capacity, M, 4, device=device)
 
             # Fill in the actual data
