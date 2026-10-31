@@ -135,7 +135,7 @@ def compute_tapvid_metrics(
     occ_acc = np.sum(
         np.equal(pred_occluded, gt_occluded) & evaluation_points,
         axis=(1, 2),
-    ) / np.sum(evaluation_points)
+    ) / np.sum(evaluation_points, axis=(1, 2))
     metrics["occlusion_accuracy"] = occ_acc
 
     # Next, convert the predictions and ground truth positions into pixel
