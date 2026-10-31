@@ -1,0 +1,11 @@
+# RGB teachers and verifier used by generate_erf_pseudo_labels.py.
+# Update these paths when copying the project to another server.
+trackon2_config_path: /remote-home/share/cjk/track_on/config/test.yaml
+trackon2_vit_pretrained_path: /remote-home/share/cjk/track_on/checkpoints/dinov3_hf/vits16plus_lvd1689m
+trackon2_checkpoint_path: /remote-home/share/cjk/track_on/checkpoints/trackon2_dinov3_checkpoint.pt
+bootstapnext_checkpoint_path: /remote-home/share/cjk/track_on/checkpoints/pseudo_teachers/bootstapnext_ckpt.npz
+bootstapir_checkpoint_path: /remote-home/ums_chenjunkang/tapnet/tapnet/checkpoints/bootstapir_checkpoint_v2.pt
+anthro_locotrack_checkpoint_path: /remote-home/share/cjk/track_on/checkpoints/pseudo_teachers/anthro_locotrack.ckpt
+alltracker_checkpoint_path: /remote-home/share/cjk/track_on/checkpoints/pseudo_teachers/alltracker.pth
+verifier_config_path: /remote-home/share/cjk/track_on/config/train_verifier.yaml
+verifier_checkpoint_path: /remote-home/share/cjk/track_on/checkpoints/pseudo_teachers/verifier.pt
