@@ -12,8 +12,9 @@ import json
 import os
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import torch
@@ -93,6 +94,9 @@ def make_loader(args, training, rank=0, world_size=1):
         )
     elif training and world_size > 1:
         sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=True, seed=args.seed)
+    elif not training and world_size > 1:
+        # Keep original dataset indices and never pad validation with duplicate clips.
+        sampler = range(rank, len(dataset), world_size)
     else:
         sampler = None
     workers = args.num_workers if training else getattr(args, "val_num_workers", args.num_workers)
@@ -162,7 +166,7 @@ def build_model(args, device):
 
 
 def load_event_checkpoint(model, path, device):
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
+    checkpoint = torch.load(path, map_location=device, weights_only=True)
     state = checkpoint["model"]
     # Accept checkpoints saved before event fusion moved into its own module.
     state = {
@@ -176,9 +180,17 @@ def load_event_checkpoint(model, path, device):
 
 @torch.no_grad()
 def evaluate(model, loader, args, device, event_mode):
-    metrics = []
-    position_errors = []
-    for raw_batch in loader:
+    distributed = dist.is_initialized()
+    rank = dist.get_rank() if distributed else 0
+    if distributed:
+        # Match rank 0's BatchNorm statistics after the last training forward.
+        for buffer in model.buffers():
+            dist.broadcast(buffer, src=0)
+    keys = ("average_jaccard", "occlusion_accuracy", "average_pts_within_thresh")
+    totals = np.zeros((2, 4), dtype=np.float64)  # Sums and counts, including pixel errors.
+    started = perf_counter()
+    print(f"validation {event_mode}: rank={rank}, batches={len(loader)}", flush=True)
+    for batch_index, raw_batch in enumerate(loader, 1):
         batch = move_batch(raw_batch, device)
         tracks = batch["tracks"]
         visibility = batch["visibility"]
@@ -201,18 +213,26 @@ def evaluate(model, loader, args, device, event_mode):
             predicted.permute(0, 2, 1, 3).cpu().numpy(),
             "first",
         )
-        metrics.append(metric)
+        values = np.stack([metric[key] for key in keys])
+        totals[0, :3] += np.nansum(values, axis=1)
+        totals[1, :3] += (~np.isnan(values)).sum(axis=1)
         after_query = torch.arange(tracks.shape[1], device=device)[None, :, None] > queries[:, None, :, 0]
         scored = visibility & after_query
-        position_errors.extend(torch.linalg.vector_norm(predicted - tracks, dim=-1)[scored].cpu().tolist())
+        errors = torch.linalg.vector_norm(predicted - tracks, dim=-1)[scored]
+        totals[0, 3] += errors.double().sum().item()
+        totals[1, 3] += errors.numel()
+        if batch_index % 100 == 0 or batch_index == len(loader):
+            print(f"validation {event_mode}: rank={rank}, batch={batch_index}/{len(loader)}, "
+                  f"elapsed={perf_counter() - started:.1f}s", flush=True)
 
-    result = {
-        "AJ": float(np.nanmean([m["average_jaccard"][0] for m in metrics])),
-        "OA": float(np.nanmean([m["occlusion_accuracy"][0] for m in metrics])),
-        "delta_avg": float(np.nanmean([m["average_pts_within_thresh"][0] for m in metrics])),
-        "mean_error_px": float(np.mean(position_errors)),
-    }
-    print(f"{event_mode}: " + ", ".join(f"{key}={value:.4f}" for key, value in result.items()))
+    if distributed:
+        reduced = torch.as_tensor(totals, device=device)
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        totals = reduced.cpu().numpy()
+    means = np.divide(totals[0], totals[1], out=np.full(4, np.nan), where=totals[1] > 0)
+    result = dict(zip(("AJ", "OA", "delta_avg", "mean_error_px"), means.tolist()))
+    if rank == 0:
+        print(f"{event_mode}: " + ", ".join(f"{key}={value:.4f}" for key, value in result.items()), flush=True)
     return result
 
 
@@ -408,11 +428,10 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
                     recent.zero_()
                     recent_batches = 0
 
+        raw_model.eval()
+        score = evaluate(raw_model, val_loader, args, device, "fused") if not skip_eval else None
         if rank == 0:
-            raw_model.eval()
-            score = None
-            if not skip_eval:
-                score = evaluate(raw_model, val_loader, args, device, "fused")
+            if score is not None:
                 with (output_dir / "eval_history.jsonl").open("a") as handle:
                     handle.write(json.dumps({"epoch": epoch + 1, "step": total_steps, **score}) + "\n")
             improved = score is not None and score["AJ"] > best_aj
@@ -438,17 +457,18 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
         if max_steps is not None and total_steps >= max_steps:
             break
 
-    # Final validation can outlast the NCCL timeout; close the group first.
+    if not skip_eval:
+        raw_model.eval()
+        load_event_checkpoint(raw_model, output_dir / "best.pt", "cpu")
+        results = {mode: evaluate(raw_model, val_loader, args, device, mode)
+                   for mode in ("rgb", "fused", "zero")}
+        if rank == 0:
+            with (output_dir / "metrics.json").open("w") as handle:
+                json.dump(results, handle, indent=2)
+
     if dist.is_initialized():
         dist.barrier()
         dist.destroy_process_group()
-
-    if rank == 0 and not skip_eval:
-        load_event_checkpoint(raw_model, output_dir / "best.pt", device)
-        results = {mode: evaluate(raw_model, val_loader, args, device, mode)
-                   for mode in ("rgb", "fused", "zero")}
-        with (output_dir / "metrics.json").open("w") as handle:
-            json.dump(results, handle, indent=2)
 
 
 def main():
@@ -463,7 +483,11 @@ def main():
     parser.add_argument("--resume", type=str, help="Full-training checkpoint to resume in its original run directory")
     parser.add_argument("--reset-best", action="store_true", help="Reset best AJ and start a new run directory for changed validation data")
     parser.add_argument("--eval-checkpoint", type=str)
+    parser.add_argument("--dist-timeout", type=int, default=3600, metavar="SECONDS",
+                        help="Distributed operation timeout in seconds (default: 3600)")
     cli = parser.parse_args()
+    if cli.dist_timeout <= 0:
+        parser.error("--dist-timeout must be positive")
     if cli.reset_best and not cli.resume:
         parser.error("--reset-best requires --resume")
     if cli.resume:
@@ -488,8 +512,8 @@ def main():
     if cli.gpus is not None:
         if any(gpu < 0 for gpu in cli.gpus) or len(set(cli.gpus)) != len(cli.gpus):
             parser.error("--gpus requires distinct, non-negative GPU IDs")
-        if len(cli.gpus) > 1 and (cli.check_data or cli.eval_checkpoint):
-            parser.error("multiple --gpus IDs are only supported for training")
+        if len(cli.gpus) > 1 and cli.check_data:
+            parser.error("multiple --gpus IDs are not supported with --check-data")
         selected = ",".join(map(str, cli.gpus))
         if os.environ.get("_TRACK_ON_FE_GPU_LAUNCHED") == "1":
             if os.environ.get("CUDA_VISIBLE_DEVICES") != selected or world_size != len(cli.gpus):
@@ -529,12 +553,12 @@ def main():
     if not torch.cuda.is_available():
         raise RuntimeError("This experiment requires a CUDA GPU")
 
-    if world_size > 1 and not cli.eval_checkpoint:
+    if world_size > 1:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(backend="nccl", init_method="env://", timeout=timedelta(seconds=cli.dist_timeout))
+        if rank == 0:
+            print(f"Distributed timeout: {cli.dist_timeout}s", flush=True)
     device = torch.device("cuda", local_rank if world_size > 1 else 0)
-    if cli.eval_checkpoint and rank != 0:
-        return
     if not cli.resume or cli.reset_best:
         args.output_dir = str(create_run_directory(args.output_dir))
     if rank == 0:
@@ -545,13 +569,13 @@ def main():
                            "resume": cli.resume, "reset_best": cli.reset_best}, handle, indent=2)
     model = build_model(args, device)
     if cli.eval_checkpoint:
-        load_event_checkpoint(model, cli.eval_checkpoint, device)
+        load_event_checkpoint(model, cli.eval_checkpoint, "cpu")
     else:
         train_loader = make_loader(args, training=True, rank=rank, world_size=world_size)
         if world_size > 1:
             model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
         if hasattr(args, "epoch_num") and not cli.overfit_one_batch:
-            val_loader = make_loader(args, training=False) if rank == 0 and not cli.skip_eval else None
+            val_loader = make_loader(args, training=False, rank=rank, world_size=world_size) if not cli.skip_eval else None
             train_full(model, train_loader, val_loader, args, device, rank,
                        max_steps=cli.max_steps, skip_eval=cli.skip_eval, resume_path=cli.resume,
                        reset_best=cli.reset_best)
@@ -563,27 +587,28 @@ def main():
             raise ValueError("Training steps must be positive")
         train(model, train_loader, args, device, steps, cli.overfit_one_batch, rank=rank)
         if world_size > 1:
-            dist.barrier()
-            dist.destroy_process_group()
             model = model.module
-        if rank != 0:
-            return
-        output = Path(args.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        path = output / ("overfit.pt" if cli.overfit_one_batch else "frame_event_last.pt")
-        torch.save({"model": model.state_dict(), "step": steps}, path)
-        print(f"checkpoint: {path}")
+        if rank == 0:
+            output = Path(args.output_dir)
+            output.mkdir(parents=True, exist_ok=True)
+            path = output / ("overfit.pt" if cli.overfit_one_batch else "frame_event_last.pt")
+            torch.save({"model": model.state_dict(), "step": steps}, path)
+            print(f"checkpoint: {path}")
 
     if not cli.overfit_one_batch and not cli.skip_eval:
-        val_loader = make_loader(args, training=False)
+        model.eval()
+        val_loader = make_loader(args, training=False, rank=rank, world_size=world_size)
         results = {
             mode: evaluate(model, val_loader, args, device, mode)
             for mode in ("rgb", "fused", "zero")
         }
-        output = Path(args.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        with (output / "metrics.json").open("w") as handle:
-            json.dump(results, handle, indent=2)
+        if rank == 0:
+            with (Path(args.output_dir) / "metrics.json").open("w") as handle:
+                json.dump(results, handle, indent=2)
+
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

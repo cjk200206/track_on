@@ -1,10 +1,15 @@
 # Paired control: initialize model weights, then start fresh optimization.
+# Fast totals 20%; panning totals 40%; batch and sequential motion each total 50%.
 event_kubric_root: data/event_kubric
 event_kubric_sources:
-  - {name: train_batch, weight: 30, val_fraction: 0.1}
-  - {name: train_seq, weight: 30, val_fraction: 0.1}
-  - {name: train_batch_panning, weight: 20, val_fraction: 0.1}
-  - {name: train_seq_panning, weight: 20, val_fraction: 0.1}
+  - {name: train_batch, weight: 24, val_fraction: 0.1}
+  - {name: train_seq, weight: 24, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 16, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 16, val_fraction: 0.1}
+  - {name: fast_batch, weight: 6, val_fraction: 0.1}
+  - {name: fast_seq, weight: 6, val_fraction: 0.1}
+  - {name: fast_batch_panning, weight: 4, val_fraction: 0.1}
+  - {name: fast_seq_panning, weight: 4, val_fraction: 0.1}
 split_seed: 1234
 samples_per_epoch: 9024
 checkpoint_path: outputs/frame_event_motion_etap_new/20261007_151640/best.pt
@@ -20,8 +25,8 @@ spatial_augmentation: false
 spatial_scale_range: [1.0, 1.2]
 eval_start: null
 bs: 1
-num_workers: 4
-val_num_workers: 2
+num_workers: 8
+val_num_workers: 4
 
 M: 24
 D: 256

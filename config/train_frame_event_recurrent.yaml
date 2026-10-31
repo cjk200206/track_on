@@ -1,11 +1,15 @@
 # TAPFormer-style recurrent frontend with pretrained ETAP.
-# Panning totals 40%; batch and sequential motion each total 50%.
+# Fast totals 20%; panning totals 40%; batch and sequential motion each total 50%.
 event_kubric_root: data/event_kubric
 event_kubric_sources:
-  - {name: train_batch, weight: 30, val_fraction: 0.1}
-  - {name: train_seq, weight: 30, val_fraction: 0.1}
-  - {name: train_batch_panning, weight: 20, val_fraction: 0.1}
-  - {name: train_seq_panning, weight: 20, val_fraction: 0.1}
+  - {name: train_batch, weight: 24, val_fraction: 0.1}
+  - {name: train_seq, weight: 24, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 16, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 16, val_fraction: 0.1}
+  - {name: fast_batch, weight: 6, val_fraction: 0.1}
+  - {name: fast_seq, weight: 6, val_fraction: 0.1}
+  - {name: fast_batch_panning, weight: 4, val_fraction: 0.1}
+  - {name: fast_seq_panning, weight: 4, val_fraction: 0.1}
 split_seed: 1234
 samples_per_epoch: 9024
 checkpoint_path: null  # Random tracker; DINOv3 remains pretrained and frozen.
@@ -17,6 +21,8 @@ T: 24
 N: 192
 val_points: 128
 frame_interval: 4
+spatial_augmentation: true
+spatial_scale_range: [1.0, 1.2]
 # Training samples across the full sequence, starting at actual RGB anchors.
 # Validation does the same with fixed per-sequence randomness; 0 restores prefix clips.
 eval_start: null
@@ -45,8 +51,8 @@ delta_v: 0.8
 # 9,024 samples / 24 = 376 updates per epoch; 96 epochs = 36,096 updates.
 epoch_num: 96
 grad_accum_steps: 4
-warmup_ratio: 0.01  # 90 successful updates, followed by cosine decay.
-save_every: 4
+warmup_ratio: 0.01  # 360 successful updates on six GPUs, followed by cosine decay.
+save_every: 10
 overfit_steps: 100
 log_every: 20
 lr: 0.0005

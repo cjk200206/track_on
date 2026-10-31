@@ -1,10 +1,14 @@
-# Baseline on the same four delayed-motion sources as frame_event_motion_etap_new.
-# Panning totals 40%; every source uses a 0.1 held-out validation fraction.
+# Baseline on the same eight delayed-motion sources as frame_event_motion_etap_new.
+# Fast totals 20%; panning totals 40%; batch and sequential motion each total 50%.
 event_kubric_sources:
-  - {name: train_batch, weight: 30, val_fraction: 0.1}
-  - {name: train_seq, weight: 30, val_fraction: 0.1}
-  - {name: train_batch_panning, weight: 20, val_fraction: 0.1}
-  - {name: train_seq_panning, weight: 20, val_fraction: 0.1}
+  - {name: train_batch, weight: 24, val_fraction: 0.1}
+  - {name: train_seq, weight: 24, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 16, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 16, val_fraction: 0.1}
+  - {name: fast_batch, weight: 6, val_fraction: 0.1}
+  - {name: fast_seq, weight: 6, val_fraction: 0.1}
+  - {name: fast_batch_panning, weight: 4, val_fraction: 0.1}
+  - {name: fast_seq_panning, weight: 4, val_fraction: 0.1}
 
 # RGB-only Track-On2 pretraining on existing ETAP/TAPFormer EventKubric data.
 # One epoch draws 9,024 sequences globally; 4 GPUs x 1 x 8 gives 282 updates.

@@ -15,7 +15,7 @@ N: 192
 val_points: 128
 frame_interval: 4
 bs: 1
-num_workers: 4
+num_workers: 8
 val_num_workers: 2
 
 M: 24
