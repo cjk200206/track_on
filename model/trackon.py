@@ -226,7 +226,25 @@ class Track_On2(nn.Module):
         return c
     
     # Multiscale ViT-Adapter
-    def forward(self, video, queries, p_mask=0.1, events=None, img_ifnew=None):
+    def forward(self, video, queries, p_mask=0.1, events=None, img_ifnew=None,
+                warmup_steps=0, _state=None):
+        if warmup_steps:
+            if not 0 < warmup_steps < video.shape[1]:
+                raise ValueError("warmup_steps must leave a nonempty supervised segment")
+            state = {}
+            with torch.no_grad():
+                self.forward(video[:, :warmup_steps], queries.clone(), p_mask=p_mask,
+                             events=None if events is None else events[:, :warmup_steps],
+                             img_ifnew=None if img_ifnew is None else img_ifnew[:, :warmup_steps],
+                             _state=state)
+            # AMP must not reuse weight casts cached by the no-grad prefix.
+            torch.clear_autocast_cache()
+            queries = queries.clone()
+            queries[..., 0] -= warmup_steps
+            return self.forward(video[:, warmup_steps:], queries, p_mask=p_mask,
+                                events=None if events is None else events[:, warmup_steps:],
+                                img_ifnew=None if img_ifnew is None else img_ifnew[:, warmup_steps:],
+                                _state=state)
         # :args video: (B, T, 3, H_in, W_in) in range [0, 255]
         # :args gt_tracks: (B, T, N, 2) in range [0, H_in] and [0, W_in]
         # :args queries: (B, N, 3) where 3 is (t, x, y) in range [0, 255]
@@ -263,12 +281,20 @@ class Track_On2(nn.Module):
         # === === ===
 
         # == Feature Projection ==
-        f4, f8, f16, f32 = self._backbone_features(video, events=events, img_ifnew=img_ifnew)
+        frontend_state = None
+        if _state is not None and isinstance(self.backbone, EventBackbone):
+            if "frontend" not in _state:
+                _state["frontend"] = self.backbone.create_state()
+            frontend_state = _state["frontend"]
+        f4, f8, f16, f32 = self._backbone_features(
+            video, events=events, img_ifnew=img_ifnew, frontend_state=frontend_state)
         f_fused = self.fpn(f4, f8, f16, f32)                              # (B, T, P, D)
         # === === ===
 
         # === Sample query features from f_fused ===
         query_init = torch.zeros(B, N, D, device=device)            # empty tensor of shape B, N, D
+        if _state is not None and "query_init" in _state:
+            query_init = _state["query_init"].clone()
         query_times = queries[:, :, 0].long()                       # (B, N)
         query_coords_norm = queries[..., 1:].clone()                # (B, N, 2)
         query_coords_norm  = query_coords_norm * 2 - 1              # (B, N, 2), in range [-1, 1]
@@ -293,6 +319,8 @@ class Track_On2(nn.Module):
         memories = [PointMemory.empty(query_init, N, M, D, self.uses_history) for _ in range(B)]
         rgb_memories = ([PointMemory.empty(query_init, N, self.rgb_memory_size, D, self.uses_history)
                          for _ in range(B)] if self.rgb_memory_reader is not None else None)
+        if _state is not None and "memories" in _state:
+            memories, rgb_memories = _state["memories"], _state["rgb_memories"]
 
         # === Output initialization ===
         C1 = torch.zeros(B, T, N, self.P, device=device)                        # (B, T, N, P)
@@ -389,6 +417,8 @@ class Track_On2(nn.Module):
         if C2 is not None:
             out["C2"] = C2
         out.update(candidate_outputs)
+        if _state is not None:
+            _state.update(query_init=query_init, memories=memories, rgb_memories=rgb_memories)
 
         return out
     

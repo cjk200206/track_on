@@ -37,7 +37,7 @@ from dataset.frame_event_mixed import MixedFrameEventDataset, MixedFrameEventSam
 from model.loss import Loss_Function
 from utils.tensorboard_utils import FrameEventTensorBoard
 from utils.train_utils import get_scheduler, load_args_from_yaml, load_pretrained_weights
-from utils.memory_training import build_ft_optimizer, MemoryTrainingSchedule, training_clip
+from utils.memory_training import build_ft_optimizer, MemoryTrainingSchedule, training_clip, supervised_clip
 
 
 class RealFineTuneLoss(Loss_Function):
@@ -160,6 +160,9 @@ def make_loaders(args, rank, world_size, run_dir, sequences=None, resume=False):
             indices.append({"split": split, "summary": summary, "clips": records})
             print(f"{source.name}: {len(records)} / {sum(item['candidates'] for item in summary)} clips retained; "
                   f"sequences train={len(split['train'])}, val={len(split['val'])}", flush=True)
+            print(f"{source.name} modes by stride: " + str({
+                stride: {mode: sum(item['modes'][str(stride)][mode] for item in summary)
+                         for mode in ('warmup', 'cold')} for stride in source.stride_weights}), flush=True)
         index = {"sources": dict(zip(names, indices))} if multi_source else indices[0]
         index_path = run_dir / "data_index.json"
         if resume:
@@ -204,6 +207,7 @@ def make_loaders(args, rank, world_size, run_dir, sequences=None, resume=False):
         frame_interval = getattr(args, "synthetic_frame_interval", None)
         if frame_interval is None:
             frame_interval = args.rgb_native_interval // args.event_native_stride
+        min_query_points = getattr(args, "min_query_points", args.N)
         synthetic_set = FrameEventKubric(
             root=args.event_kubric_root, clip_length=args.T, num_points=args.N,
             crop_size=args.input_size,
@@ -211,6 +215,9 @@ def make_loaders(args, rank, world_size, run_dir, sequences=None, resume=False):
             training=True, seed=args.seed, sequence_paths=[Path(path) for path in synthetic_sources["paths"]],
             anchor_aligned=True, spatial_augmentation=getattr(args, "spatial_augmentation", False),
             spatial_scale_range=getattr(args, "spatial_scale_range", (1.0, 1.2)),
+            warmup_steps=getattr(args, "warmup_steps", 0),
+            warmup_fallback=getattr(args, "warmup_fallback", True),
+            min_query_points=(args.N + 1) // 2 if min_query_points is None else min_query_points,
         )
     if multi_source:
         ranges = {"synthetic": (len(train_set), len(synthetic_set))} if mixed else {}
@@ -333,9 +340,11 @@ def evaluate(model, loader, args, device, weights=None):
     totals = torch.zeros(3, dtype=torch.float64, device=device)
     for raw_batch in loader:
         batch = move_batch(raw_batch, device)
+        prefix = int(batch["warmup_steps"][0])
         with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
             out = model(batch["video"], batch["queries"].clone(), p_mask=0,
-                        events=batch["events"], img_ifnew=batch["img_ifnew"])
+                        events=batch["events"], img_ifnew=batch["img_ifnew"], warmup_steps=prefix)
+        batch = supervised_clip(batch)
         after = torch.arange(batch["tracks"].shape[1], device=device)[None, :, None] > batch["queries"][:, None, :, 0]
         mask = batch["label_valid"] & batch["visibility"] & after
         error = torch.linalg.vector_norm(out["P"].float() - batch["tracks"], dim=-1)
@@ -432,7 +441,8 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                 previous_phase = phase
             # Slice before device transfer so the adaptation phase uses less VRAM.
             batch = move_batch(training_clip(raw_batch, length), device)
-            clip_length = batch["video"].shape[1]
+            prefix = int(batch["warmup_steps"][0])
+            clip_length = batch["video"].shape[1] - prefix
             window_start = batch_index // args.grad_accum_steps * args.grad_accum_steps
             window_size = min(args.grad_accum_steps, len(loader) - window_start)
             update_now = batch_index - window_start + 1 == window_size
@@ -440,7 +450,9 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
             with sync:
                 with torch.autocast("cuda", dtype=torch.float16, enabled=args.amp):
                     out = model(batch["video"], batch["queries"].clone(), events=batch["events"],
-                                img_ifnew=batch["img_ifnew"], p_mask=args.memory_mask_probability)
+                                img_ifnew=batch["img_ifnew"], p_mask=args.memory_mask_probability,
+                                warmup_steps=prefix)
+                    batch = supervised_clip(batch)
                     if synthetic:
                         parts = dict(zip(synthetic_names, synthetic_loss_fn(
                             out, batch["tracks"], batch["visibility"], batch["queries"][..., 0].long(),
@@ -460,13 +472,14 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                                loss.new_tensor(float(synthetic)), loss.new_tensor(float(not synthetic)),
                                loss.new_tensor(syn_weight), loss.new_tensor(real_weight)))
             if source_names:
-                source_values = loss.new_zeros(2 * len(source_names), dtype=torch.float32)
+                source_values = loss.new_zeros(3 * len(source_names), dtype=torch.float32)
                 source_values[source_id] = raw_loss.detach().float()
                 source_values[len(source_names) + source_id] = 1
+                source_values[2 * len(source_names) + source_id] = float(prefix > 0)
                 values.extend(source_values.unbind())
             if frequency_keys:
                 count = len(frequency_keys)
-                frequency_values = loss.new_zeros(3 * count, dtype=torch.float32)
+                frequency_values = loss.new_zeros(4 * count, dtype=torch.float32)
                 strides = raw_batch.get("event_stride")
                 if strides is not None:
                     for index, (name, stride) in enumerate(frequency_keys):
@@ -474,11 +487,13 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                             continue
                         selected = strides == stride
                         frequency_values[2 * count + index] = selected.float().mean()
+                        frequency_values[3 * count + index] = selected.float().mean() * (prefix > 0)
                         # A mixed-frequency batch has no single per-frequency loss.
                         if selected.all():
                             frequency_values[index] = raw_loss.detach().float()
                             frequency_values[count + index] = 1
                 values.extend(frequency_values.unbind())
+            values.append(loss.new_tensor(float(prefix > 0)))
             values = torch.stack(values)
             window = values if window is None else window + values
             window_batches += 1
@@ -518,7 +533,9 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                 fraction = means[metric_offset + len(source_names) + source_id]
                 mixture[f"sources/{name}/loss"] = means[metric_offset + source_id] / fraction if fraction else None
                 mixture[f"sources/{name}/fraction"] = fraction
-            metric_offset += 2 * len(source_names)
+                mixture[f"sources/{name}/warmup_fraction"] = (
+                    means[metric_offset + 2 * len(source_names) + source_id] / fraction if fraction else None)
+            metric_offset += 3 * len(source_names)
             for index, (name, stride) in enumerate(frequency_keys):
                 count = len(frequency_keys)
                 batches = means[metric_offset + count + index]
@@ -527,6 +544,9 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                 prefix = f"frequencies/{name}/stride_{stride}"
                 mixture[f"{prefix}/loss"] = means[metric_offset + index] / batches if batches else None
                 mixture[f"{prefix}/fraction"] = fraction / source_fraction if source_fraction else None
+                mixture[f"{prefix}/warmup_fraction"] = (
+                    means[metric_offset + 3 * count + index] / fraction if fraction else None)
+            mixture.update(warmup_fraction=means[-1], cold_fraction=1 - means[-1])
             training_metrics = {**mixture, "successful_updates": successful_updates,
                                 "adaptation": int(phase == "adaptation"), "clip_length": clip_length,
                                 "memory_lr": optimizer.param_groups[-1]["lr"]}
@@ -614,6 +634,11 @@ def main():
                     if cli.resume else None)
     config_path = cli.config or Path(__file__).resolve().parent / "config/train_frame_event_real_ft.yaml"
     args = argparse.Namespace(**saved_config) if saved_config is not None and cli.config is None else load_args_from_yaml(config_path)
+    warmup = getattr(args, "warmup_steps", 0)
+    if not isinstance(warmup, int) or warmup < 0:
+        raise ValueError("warmup_steps must be a nonnegative integer")
+    if warmup and args.bs != 1:
+        raise ValueError("Warm/cold variable-length samples require bs=1; use gradient accumulation")
     # JSON stores mapping keys as strings; keep checkpoint/config comparisons stable.
     for source in getattr(args, "real_sources", ()):
         if "event_stride_weights" in source:

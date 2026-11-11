@@ -27,6 +27,9 @@ class FrameEventKubric(Dataset):
         anchor_aligned=False,
         spatial_augmentation=False,
         spatial_scale_range=(1.0, 1.2),
+        warmup_steps=0,
+        warmup_fallback=True,
+        min_query_points=None,
     ):
         self.root = Path(root)
         self.clip_length = clip_length
@@ -39,6 +42,11 @@ class FrameEventKubric(Dataset):
         self.anchor_aligned = anchor_aligned
         self.spatial_augmentation = training and spatial_augmentation
         self.spatial_scale_range = tuple(spatial_scale_range)
+        self.warmup_steps = warmup_steps
+        self.warmup_fallback = warmup_fallback
+        self.min_query_points = num_points if min_query_points is None else min_query_points
+        if not 1 <= self.min_query_points <= num_points:
+            raise ValueError("min_query_points must be between 1 and num_points")
         if (len(self.spatial_scale_range) != 2 or not np.isfinite(self.spatial_scale_range).all()
                 or not 0 < self.spatial_scale_range[0] <= self.spatial_scale_range[1]):
             raise ValueError("spatial_scale_range must contain two ordered positive scales")
@@ -118,33 +126,47 @@ class FrameEventKubric(Dataset):
         rng = np.random if self.training else np.random.default_rng(self.seed + index)
         # A null eval_start samples reproducible windows throughout the sequence.
         starts = rng.permutation(candidates_starts) if self.training or self.eval_start is None else [self.eval_start]
+        modes = ([self.warmup_steps, 0] if self.warmup_steps and self.warmup_fallback
+                 else [self.warmup_steps])
         for start in starts:
-            if start + self.clip_length > num_intervals:
-                raise ValueError(f"{sequence}: clip {start}:{start + self.clip_length} exceeds {num_intervals} intervals")
-            interval_indices = np.arange(start, start + self.clip_length)
-            annotation_indices = interval_indices + 1
-            tracks = all_tracks[:, annotation_indices].transpose(1, 0, 2).copy()
-            if (resize_h, resize_w) != (height, width):
-                # OpenCV linear resize maps pixel centers with a half-pixel offset.
-                tracks = (tracks + 0.5) * np.array([resize_w / width, resize_h / height], dtype=np.float32) - 0.5
-            tracks[..., 0] -= x0
-            tracks[..., 1] -= y0
-            if flip_h:
-                tracks[..., 0] = crop_w - 1 - tracks[..., 0]
-            if flip_v:
-                tracks[..., 1] = crop_h - 1 - tracks[..., 1]
-            visible = ~all_occluded[:, annotation_indices].T
-            visible &= (tracks[..., 0] >= 0) & (tracks[..., 0] < crop_w)
-            visible &= (tracks[..., 1] >= 0) & (tracks[..., 1] < crop_h)
-            first_visible = visible.argmax(axis=0)
-            later_visible = (visible & (np.arange(self.clip_length)[:, None] > first_visible)).any(axis=0)
-            candidates = np.flatnonzero(visible.any(axis=0) & later_visible)
-            if len(candidates) >= self.num_points:
-                break
+            for prefix in modes:
+                length = prefix + self.clip_length
+                if start + length > num_intervals:
+                    continue
+                interval_indices = np.arange(start, start + length)
+                annotation_indices = interval_indices + 1
+                tracks = all_tracks[:, annotation_indices].transpose(1, 0, 2).copy()
+                if (resize_h, resize_w) != (height, width):
+                    # OpenCV linear resize maps pixel centers with a half-pixel offset.
+                    tracks = (tracks + 0.5) * np.array([resize_w / width, resize_h / height], dtype=np.float32) - 0.5
+                tracks[..., 0] -= x0
+                tracks[..., 1] -= y0
+                if flip_h:
+                    tracks[..., 0] = crop_w - 1 - tracks[..., 0]
+                if flip_v:
+                    tracks[..., 1] = crop_h - 1 - tracks[..., 1]
+                visible = ~all_occluded[:, annotation_indices].T
+                visible &= (tracks[..., 0] >= 0) & (tracks[..., 0] < crop_w)
+                visible &= (tracks[..., 1] >= 0) & (tracks[..., 1] < crop_h)
+                first_visible = visible.argmax(axis=0)
+                supervised = ((np.arange(length)[:, None] >= prefix)
+                              & (np.arange(length)[:, None] > first_visible))
+                eligible = visible.any(axis=0) & (visible & supervised).any(axis=0)
+                if prefix:
+                    eligible &= first_visible < prefix
+                candidates = np.flatnonzero(eligible)
+                if len(candidates) >= self.min_query_points:
+                    break
+            else:
+                continue
+            break
         else:
-            raise ValueError(f"{sequence}: no {self.clip_length}-step window has {self.num_points} usable points")
+            raise ValueError(f"{sequence}: no training window has {self.min_query_points} usable points")
 
-        selected = rng.choice(candidates, self.num_points, replace=False)
+        selected = rng.choice(candidates, min(self.num_points, len(candidates)), replace=False)
+        if len(selected) < self.num_points:
+            selected = np.concatenate((selected, rng.choice(candidates, self.num_points - len(selected), replace=True)))
+            rng.shuffle(selected)
         frames = []
         event_maps = []
         new_frame = []
@@ -168,6 +190,7 @@ class FrameEventKubric(Dataset):
             raise ValueError(f"{sequence}: expected aligned RGB and 10-channel time surfaces")
 
         return {
+            "warmup_steps": torch.tensor(prefix),
             "video": self._transform_maps(video, transform),
             "events": self._transform_maps(events, transform),
             "tracks": torch.from_numpy(np.ascontiguousarray(tracks[:, selected])).float(),

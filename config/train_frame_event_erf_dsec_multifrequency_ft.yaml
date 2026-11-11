@@ -1,4 +1,5 @@
-# Three ERF frequencies with independent point pools and T=24 student steps.
+# Three ERF frequencies with independent point pools and T=24 supervised steps.
+# Prefer 24 warmup steps; fall back to cold training when coverage/points are insufficient.
 # RGB stays at native interval 16; choose one available stride per sample.
 real_sources:
   - name: erf
@@ -44,7 +45,10 @@ photometric_augmentation: true
 
 input_size: [384, 512]
 T: 24
+warmup_steps: 24  # Set 0 for ordinary training from empty memory.
+warmup_fallback: true
 N: 192
+min_query_points: null  # Defaults to ceil(N / 2); repeat points to reach N when needed.
 # Excludes initialization; unknown labels do not count as visible supervision.
 min_visible_fraction: 0.5
 val_fraction: 0.1

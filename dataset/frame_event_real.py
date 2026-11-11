@@ -133,13 +133,20 @@ def read_event_index(args, sequence, images, stride, exposures):
 
 
 def build_real_index(args, sequences):
-    """Index aligned T-step clips and eligible points independently per frequency."""
+    """Choose warm or cold training and eligible points independently per frequency."""
     missing = [f"stride_{stride}/{name}" for stride, root in args.event_roots.items()
                for name in sequences if not (Path(root) / f"{name}.h5").is_file()]
     if missing:
         raise FileNotFoundError(f"{args.name}: {len(missing)} event caches missing; "
                                 f"finish conversion first (e.g. {', '.join(missing[:5])})")
     records, summary = [], []
+    warmup = getattr(args, "warmup_steps", 0)
+    modes = [warmup, 0] if warmup and getattr(args, "warmup_fallback", True) else [warmup]
+    # Preserve full pools for old configs; explicit null opts into half-size pools.
+    min_points = getattr(args, "min_query_points", args.N)
+    min_points = math.ceil(args.N / 2) if min_points is None else min_points
+    if not isinstance(min_points, int) or not 1 <= min_points <= args.N:
+        raise ValueError("min_query_points must be an integer between 1 and N")
     for name in sequences:
         sequence = Path(args.root) / name
         images = sorted((sequence / args.rgb_directory).glob("*.png"))
@@ -161,6 +168,7 @@ def build_real_index(args, sequences):
         if not labels:
             raise FileNotFoundError(f"No pseudo labels for {name}: {args.label_root}")
         kept = 0
+        mode_counts = {str(stride): {"warmup": 0, "cold": 0} for stride in caches}
         for path in labels:
             with np.load(path, allow_pickle=False) as data:
                 metadata = json.loads(data["metadata"].item())
@@ -180,41 +188,44 @@ def build_real_index(args, sequences):
                     raise ValueError(f"Incompatible first-frame pseudo labels: {path}")
                 frequencies = {}
                 for stride, (indices, times, _) in caches.items():
-                    requested = native[0] + np.arange(args.T) * stride
-                    if requested[-1] > native[-1] or requested[-1] > indices[-1]:
-                        continue
-                    label_rows = matching_rows(native, requested, path)
-                    event_rows = matching_rows(indices, requested, args.event_roots[stride])
-                    if not np.array_equal(data["timestamps_us"][label_rows], times[event_rows]):
-                        raise ValueError(f"Pseudo-label/event timestamp mismatch: {path}, stride={stride}")
-                    if exposures is not None:
-                        if (metadata["dataset"] != "DSEC" or metadata["rgb_directory"] != args.rgb_directory
-                                or metadata["rgb_timestamps_estimated"]
-                                or not np.array_equal(data["exposure_timestamps_us"][label_rows], exposures[requested])
-                                or np.any(np.diff(times[event_rows]) > 75000)):
-                            raise ValueError(f"DSEC label exposure metadata or continuity mismatch: {path}")
-                    _, _, scaled_valid = resize_labels(
-                        tracks[label_rows], queries, valid[label_rows], size, tuple(args.input_size),
-                    )
-                    usable = scaled_valid & visible[label_rows]
-                    supervised = usable[1:]
-                    required_steps = math.ceil(len(supervised) * args.min_visible_fraction)
-                    points = np.flatnonzero(usable[0] & (supervised.sum(0) >= required_steps))
-                    if len(points) < args.N:
-                        continue
-                    frequencies[str(stride)] = {
-                        "points": points.tolist(),
-                        "label_rows": label_rows.tolist(), "event_rows": event_rows.tolist(),
-                        "frame_indices": requested.tolist(), "timestamps_us": times[event_rows].tolist(),
-                        "rgb_files": [images[int(frame)].name for frame in requested],
-                    }
+                    for prefix in modes:
+                        requested = native[0] + np.arange(prefix + args.T) * stride
+                        if requested[-1] > native[-1] or requested[-1] > indices[-1]:
+                            continue
+                        label_rows = matching_rows(native, requested, path)
+                        event_rows = matching_rows(indices, requested, args.event_roots[stride])
+                        if not np.array_equal(data["timestamps_us"][label_rows], times[event_rows]):
+                            raise ValueError(f"Pseudo-label/event timestamp mismatch: {path}, stride={stride}")
+                        if exposures is not None:
+                            if (metadata["dataset"] != "DSEC" or metadata["rgb_directory"] != args.rgb_directory
+                                    or metadata["rgb_timestamps_estimated"]
+                                    or not np.array_equal(data["exposure_timestamps_us"][label_rows], exposures[requested])
+                                    or np.any(np.diff(times[event_rows]) > 75000)):
+                                raise ValueError(f"DSEC label exposure metadata or continuity mismatch: {path}")
+                        _, _, scaled_valid = resize_labels(
+                            tracks[label_rows], queries, valid[label_rows], size, tuple(args.input_size),
+                        )
+                        usable = scaled_valid & visible[label_rows]
+                        supervised = usable[prefix if prefix else 1:]
+                        required_steps = math.ceil(len(supervised) * args.min_visible_fraction)
+                        points = np.flatnonzero(usable[0] & (supervised.sum(0) >= required_steps))
+                        if len(points) < min_points:
+                            continue
+                        frequencies[str(stride)] = {
+                            "warmup_steps": prefix, "points": points.tolist(),
+                            "label_rows": label_rows.tolist(), "event_rows": event_rows.tolist(),
+                            "frame_indices": requested.tolist(), "timestamps_us": times[event_rows].tolist(),
+                            "rgb_files": [images[int(frame)].name for frame in requested],
+                        }
+                        mode_counts[str(stride)]["warmup" if prefix else "cold"] += 1
+                        break
                 if not frequencies:
                     continue
                 record = {"sequence": name, "label": str(path), "image_size": list(size), "frequencies": frequencies}
                 records.append(record)
                 kept += 1
         summary.append({"sequence": name, "candidates": len(labels), "kept": kept,
-                        "rejected": len(labels) - kept})
+                        "rejected": len(labels) - kept, "modes": mode_counts})
     return records, summary
 
 
@@ -258,7 +269,10 @@ class FrameEventReal(Dataset):
             stride = int(rng.choice(available, p=weights / weights.sum())) if self.training else available[0]
         timing = record["frequencies"][str(stride)]
         candidates = timing["points"]
-        points = rng.choice(candidates, args.N, replace=False)
+        points = rng.choice(candidates, min(args.N, len(candidates)), replace=False)
+        if len(points) < args.N:
+            points = np.concatenate((points, rng.choice(candidates, args.N - len(points), replace=True)))
+            rng.shuffle(points)
         rows = timing["label_rows"]
         with np.load(record["label"], allow_pickle=False) as data:
             tracks = data["tracks"][rows][:, points]
@@ -296,6 +310,7 @@ class FrameEventReal(Dataset):
                     surface = cv2.resize(cache["time_surface"][event_row], (width, height))
                     events[step] = surface.transpose(2, 0, 1)
         sample = {
+            "warmup_steps": torch.tensor(timing["warmup_steps"]),
             "video": torch.from_numpy(video), "events": torch.from_numpy(events),
             "tracks": torch.from_numpy(tracks), "queries": torch.from_numpy(queries),
             "visibility": torch.from_numpy(visibility.copy()), "label_valid": torch.from_numpy(valid),

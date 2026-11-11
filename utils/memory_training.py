@@ -50,8 +50,21 @@ def training_clip(batch, length):
     """Load/index one full-length dataset; shorten only adaptation forwards."""
     # Synthetic queries can start late. Keep a query and a following step in each
     # sample instead of producing a loss with no initialized points or gradients.
+    prefix = int(batch["warmup_steps"][0]) if "warmup_steps" in batch else 0
+    length += prefix
     first_query = batch["queries"][..., 0].amin(dim=1).max().item()
     length = min(batch["video"].shape[1], max(length, int(first_query) + 2))
     temporal = {"video", "events", "tracks", "visibility", "label_valid",
                 "img_ifnew", "frame_indices", "timestamps_us"}
     return {key: value[:, :length] if key in temporal else value for key, value in batch.items()}
+
+
+def supervised_clip(batch):
+    """Align targets and query times with the model's post-warmup outputs."""
+    prefix = int(batch["warmup_steps"][0]) if "warmup_steps" in batch else 0
+    temporal = {"video", "events", "tracks", "visibility", "label_valid",
+                "img_ifnew", "frame_indices", "timestamps_us"}
+    result = {key: value[:, prefix:] if key in temporal else value for key, value in batch.items()}
+    result["queries"] = batch["queries"].clone()
+    result["queries"][..., 0] -= prefix
+    return result
