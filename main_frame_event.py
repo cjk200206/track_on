@@ -4,6 +4,7 @@ Use --check-data to inspect alignment and --max-steps for a short training check
 Use --gpus to select GPU IDs, or launch with torchrun.
 Use --resume PATH to continue from a full-training checkpoint.
 Use --eval-checkpoint PATH to repeat the three validation modes.
+TensorBoard scalars are saved under each run's tensorboard/ directory.
 """
 
 import argparse
@@ -29,6 +30,7 @@ from model.loss import Loss_Function
 from model.trackon import Track_On2
 from utils.coord_utils import get_queries
 from utils.eval_utils import compute_tapvid_metrics
+from utils.tensorboard_utils import FrameEventTensorBoard
 from utils.train_utils import get_scheduler, load_args_from_yaml, load_pretrained_weights
 
 
@@ -236,7 +238,7 @@ def evaluate(model, loader, args, device, event_mode):
     return result
 
 
-def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
+def train(model, loader, args, device, steps, overfit_one_batch, logger, rank=0):
     optimizer = torch.optim.AdamW(
         (p for p in model.parameters() if p.requires_grad),
         lr=args.lr,
@@ -255,6 +257,7 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
     running_sums = torch.zeros_like(window_sums)
     window_steps = 0
     running_steps = 0
+    logger.start()
 
     for step in range(1, steps + 1):
         if fixed_batch is None:
@@ -285,6 +288,8 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
         if not torch.isfinite(gradient_norm):
             raise RuntimeError(f"Non-finite event gradient at step {step}")
         optimizer.step()
+        logger.training(step, lr=optimizer.param_groups[0]["lr"], epoch=epoch + 1,
+                        grad_norm=gradient_norm, optimizer_updated=True, microbatches=1)
         window_sums += torch.stack((loss.detach().float(), *(part.detach().float() for part in losses)))
         window_steps += 1
         if step % args.log_every == 0 or step == steps:
@@ -298,6 +303,7 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
             if rank == 0:
                 recent_components = dict(zip(loss_names, recent_means[1:]))
                 running_components = dict(zip(loss_names, running_means[1:]))
+                logger.training(step, loss=recent_means[0], components=recent_components)
                 parts = ", ".join(f"{name}={value:.4f}" for name, value in recent_components.items())
                 record = {
                     "step": step,
@@ -318,7 +324,7 @@ def train(model, loader, args, device, steps, overfit_one_batch, rank=0):
             window_steps = 0
 
 
-def train_full(model, loader, val_loader, args, device, rank, max_steps=None, skip_eval=False, resume_path=None,
+def train_full(model, loader, val_loader, args, device, rank, logger, max_steps=None, skip_eval=False, resume_path=None,
                reset_best=False):
     accumulation = args.grad_accum_steps
     if accumulation < 1:
@@ -356,6 +362,7 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
             print(f"Resumed from {resume_path}: epoch={start_epoch}, step={total_steps}, "
                   f"best AJ={best_aj:.4f}, AMP scale={scaler.get_scale():g}", flush=True)
     output_dir = Path(args.output_dir)
+    logger.start(total_steps)
     for epoch in range(start_epoch, args.epoch_num):
         if hasattr(loader.sampler, "set_epoch"):
             loader.sampler.set_epoch(epoch)
@@ -408,11 +415,15 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
                     )
                 optimizer.zero_grad(set_to_none=True)
                 total_steps += 1
+                logger.training(total_steps, lr=optimizer.param_groups[0]["lr"], epoch=epoch + 1,
+                                grad_norm=gradient_norm, optimizer_updated=optimizer_updated,
+                                amp_scale=scaler.get_scale(), microbatches=window_size)
                 if total_steps % args.log_every == 0 or batch_index + 1 == batch_limit:
                     if dist.is_initialized():
                         dist.all_reduce(recent, op=dist.ReduceOp.SUM)
                     means = (recent / (recent_batches * world_size)).tolist()
                     if rank == 0:
+                        logger.training(total_steps, loss=means[0], components=dict(zip(names[1:], means[1:])))
                         record = {
                             "epoch": epoch + 1, "step": total_steps,
                             "loss_recent": means[0],
@@ -432,6 +443,7 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
         score = evaluate(raw_model, val_loader, args, device, "fused") if not skip_eval else None
         if rank == 0:
             if score is not None:
+                logger.evaluation(score, total_steps, epoch=epoch + 1)
                 with (output_dir / "eval_history.jsonl").open("a") as handle:
                     handle.write(json.dumps({"epoch": epoch + 1, "step": total_steps, **score}) + "\n")
             improved = score is not None and score["AJ"] > best_aj
@@ -463,6 +475,8 @@ def train_full(model, loader, val_loader, args, device, rank, max_steps=None, sk
         results = {mode: evaluate(raw_model, val_loader, args, device, mode)
                    for mode in ("rgb", "fused", "zero")}
         if rank == 0:
+            for mode, score in results.items():
+                logger.evaluation(score, total_steps, mode=f"best/{mode}")
             with (output_dir / "metrics.json").open("w") as handle:
                 json.dump(results, handle, indent=2)
 
@@ -567,48 +581,56 @@ def main():
             with (Path(args.output_dir) / "run_config.json").open("w") as handle:
                 json.dump({"config_path": cli.config, "args": vars(args),
                            "resume": cli.resume, "reset_best": cli.reset_best}, handle, indent=2)
-    model = build_model(args, device)
-    if cli.eval_checkpoint:
-        load_event_checkpoint(model, cli.eval_checkpoint, "cpu")
-    else:
-        train_loader = make_loader(args, training=True, rank=rank, world_size=world_size)
-        if world_size > 1:
-            model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
-        if hasattr(args, "epoch_num") and not cli.overfit_one_batch:
-            val_loader = make_loader(args, training=False, rank=rank, world_size=world_size) if not cli.skip_eval else None
-            train_full(model, train_loader, val_loader, args, device, rank,
-                       max_steps=cli.max_steps, skip_eval=cli.skip_eval, resume_path=cli.resume,
-                       reset_best=cli.reset_best)
-            return
-        steps = cli.max_steps if cli.max_steps is not None else (
-            args.overfit_steps if cli.overfit_one_batch else args.max_steps
-        )
-        if steps < 1:
-            raise ValueError("Training steps must be positive")
-        train(model, train_loader, args, device, steps, cli.overfit_one_batch, rank=rank)
-        if world_size > 1:
-            model = model.module
-        if rank == 0:
-            output = Path(args.output_dir)
-            output.mkdir(parents=True, exist_ok=True)
-            path = output / ("overfit.pt" if cli.overfit_one_batch else "frame_event_last.pt")
-            torch.save({"model": model.state_dict(), "step": steps}, path)
-            print(f"checkpoint: {path}")
+    logger = FrameEventTensorBoard(args, args.output_dir, rank)
+    try:
+        model = build_model(args, device)
+        if cli.eval_checkpoint:
+            checkpoint_step = load_event_checkpoint(model, cli.eval_checkpoint, "cpu")
+            logger.start(checkpoint_step or 0)
+        else:
+            train_loader = make_loader(args, training=True, rank=rank, world_size=world_size)
+            if world_size > 1:
+                model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=False)
+            if hasattr(args, "epoch_num") and not cli.overfit_one_batch:
+                val_loader = make_loader(args, training=False, rank=rank, world_size=world_size) if not cli.skip_eval else None
+                train_full(model, train_loader, val_loader, args, device, rank, logger,
+                           max_steps=cli.max_steps, skip_eval=cli.skip_eval, resume_path=cli.resume,
+                           reset_best=cli.reset_best)
+                return
+            steps = cli.max_steps if cli.max_steps is not None else (
+                args.overfit_steps if cli.overfit_one_batch else args.max_steps
+            )
+            if steps < 1:
+                raise ValueError("Training steps must be positive")
+            train(model, train_loader, args, device, steps, cli.overfit_one_batch, logger, rank=rank)
+            if world_size > 1:
+                model = model.module
+            if rank == 0:
+                output = Path(args.output_dir)
+                output.mkdir(parents=True, exist_ok=True)
+                path = output / ("overfit.pt" if cli.overfit_one_batch else "frame_event_last.pt")
+                torch.save({"model": model.state_dict(), "step": steps}, path)
+                print(f"checkpoint: {path}")
 
-    if not cli.overfit_one_batch and not cli.skip_eval:
-        model.eval()
-        val_loader = make_loader(args, training=False, rank=rank, world_size=world_size)
-        results = {
-            mode: evaluate(model, val_loader, args, device, mode)
-            for mode in ("rgb", "fused", "zero")
-        }
-        if rank == 0:
-            with (Path(args.output_dir) / "metrics.json").open("w") as handle:
-                json.dump(results, handle, indent=2)
+        if not cli.overfit_one_batch and not cli.skip_eval:
+            model.eval()
+            val_loader = make_loader(args, training=False, rank=rank, world_size=world_size)
+            results = {
+                mode: evaluate(model, val_loader, args, device, mode)
+                for mode in ("rgb", "fused", "zero")
+            }
+            if rank == 0:
+                for mode, score in results.items():
+                    logger.evaluation(score, mode=mode)
+                with (Path(args.output_dir) / "metrics.json").open("w") as handle:
+                    json.dump(results, handle, indent=2)
 
-    if dist.is_initialized():
-        dist.barrier()
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.barrier()
+    finally:
+        logger.close()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

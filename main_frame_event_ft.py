@@ -29,6 +29,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 
 from dataset.frame_event_erf import FrameEventERF, build_erf_index
 from model.loss import Loss_Function
+from utils.tensorboard_utils import FrameEventTensorBoard
 from utils.train_utils import get_scheduler, load_args_from_yaml, load_pretrained_weights
 
 
@@ -190,7 +191,7 @@ def evaluate(model, loader, args, device):
             "supervised_fraction": (totals[1] / totals[2]).item()}
 
 
-def train(model, loader, val_loader, args, cli, device, rank, run_dir, split):
+def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, logger):
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.wd)
     scheduler = get_scheduler(args, optimizer, loader, warmup=False)
@@ -211,6 +212,7 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split):
         start_epoch, start_batch, steps = state["epoch"], state["batch_in_epoch"], state["step"]
         best_error = state["best_pseudo_error_px"]
         del state
+    logger.start(steps)
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     if rank == 0:
         print(f"Train clips={len(loader.dataset)}, val clips={len(val_loader.dataset) if val_loader else 0}; "
@@ -266,6 +268,9 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split):
             if dist.is_initialized():
                 dist.all_reduce(window)
             means = (window / (window_batches * world_size)).tolist()
+            logger.training(steps, loss=means[0], components=dict(zip(loss_names, means[1:])),
+                            lr=optimizer.param_groups[0]["lr"], epoch=epoch + 1, grad_norm=norm,
+                            optimizer_updated=updated, amp_scale=scaler.get_scale(), microbatches=window_size)
             if rank == 0 and (steps % args.log_every == 0 or steps == 1 or next_batch == len(loader)):
                 record = {"epoch": epoch + 1, "step": steps, "loss": means[0],
                           "components": dict(zip(loss_names, means[1:])), "lr": optimizer.param_groups[0]["lr"],
@@ -284,6 +289,7 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split):
         complete = next_batch == len(loader)
         if rank == 0:
             if score is not None:
+                logger.evaluation(score, steps, epoch=epoch + 1)
                 with (run_dir / "eval_metrics.jsonl").open("a") as handle:
                     handle.write(json.dumps({"epoch": epoch + 1, "step": steps, **score}) + "\n")
                 print(f"Pseudo-label validation (not GT): {score}", flush=True)
@@ -377,6 +383,7 @@ def main():
         if not cli.resume:
             write_json(run_dir / "run_config.json", vars(args))
         print(f"run directory: {run_dir}", flush=True)
+    logger = FrameEventTensorBoard(args, run_dir, rank)
     try:
         train_loader, val_loader, split = make_loaders(args, rank, world_size, run_dir, args.sequences, bool(cli.resume))
         if cli.check_data:
@@ -389,8 +396,9 @@ def main():
             load_pretrained_weights(model, args.checkpoint_path)
         if dist.is_initialized():
             model = DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
-        train(model, train_loader, val_loader, args, cli, device, rank, run_dir, split)
+        train(model, train_loader, val_loader, args, cli, device, rank, run_dir, split, logger)
     finally:
+        logger.close()
         if dist.is_initialized():
             dist.destroy_process_group()
 
