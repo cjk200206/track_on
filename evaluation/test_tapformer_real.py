@@ -3,6 +3,8 @@
 Run from the repository root:
     python -m evaluation.test_tapformer_real --config config/test_tapformer_real.yaml
     python -m evaluation.test_tapformer_real --config config/test_tapformer_frame_event.yaml
+
+Add --memory-diagnostic --sequence Day_Bridge to visualize baseline memory slots.
 """
 import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
@@ -22,12 +24,8 @@ import yaml
 
 from dataset.tapformer_real import load_real_tap_event_stream, load_real_tap_sequence
 from evaluation.result_export import TAPVID_CSV_COLUMNS, write_summary_csv
-from evaluation.track_video import render_tracking_video
-from model.rgb_memory_predictor import RGBMemoryPredictor
-from model.trackon_predictor import Predictor
+from evaluation.track_video import render_localization_timeline, render_tracking_video
 from utils.coord_utils import get_points_on_a_grid
-from utils.eval_utils import compute_tapvid_metrics
-from utils.train_utils import load_args_from_yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -48,6 +46,10 @@ def load_config(path):
             raise ValueError(f"Missing config key: {key}")
     if config.get("input_mode", "rgb") not in {"rgb", "frame_event"}:
         raise ValueError("input_mode must be 'rgb' or 'frame_event'")
+    vis = config.get("visualization", {})
+    if (vis.get("enabled", False) and vis.get("show_events", False)
+            and config.get("input_mode", "rgb") != "frame_event"):
+        raise ValueError("visualization.show_events requires frame_event input")
     return config
 
 
@@ -86,9 +88,78 @@ def resolve_memory_policy(config, memory_size):
     return dict(type=kind, recent_size=recent_size, rgb_size=rgb_size)
 
 
+class MemoryDiagnostic:
+    """Observe baseline predictions and legacy recent/RGB slots without changing them."""
+
+    def __init__(self, predictor, sequence, event_stream):
+        self.predictor = predictor
+        self.n = sequence.tracks.shape[1]
+        self.rgb_size = predictor.rgb_size
+        self.gt_occluded = sequence.occluded[event_stream.rgb_indices]
+        self.source = np.full(predictor.model.M, -1, dtype=np.int32)
+        self.new_rgb = []
+        self.score_steps = []
+        self.positions, self.probabilities = [], []
+        self.slot_states, self.sources = [], []
+        self.rows = []
+        self.handle = predictor.model.prediction_head.register_forward_hook(self.capture_probability)
+
+    def capture_probability(self, module, inputs, output):
+        self.probability = output[1][:self.n].sigmoid().float().cpu().numpy()
+
+    def before_step(self, step, new_rgb):
+        self.step = step
+        self.advance_rgb = self.predictor.recent_rgb[0]
+        self.new_rgb.append(new_rgb)
+        occupied = (np.zeros((self.n, len(self.source)), dtype=bool) if self.predictor.memory is None else
+                    ~self.predictor.temporal_mask[:self.n].cpu().numpy())
+        self.read_count = occupied.sum(axis=1)
+        self.read_occluded = (occupied & self.gt_occluded[self.source.clip(min=0)].T).sum(axis=1)
+
+    def after_step(self, positions, visible, score_index, rgb_index):
+        predictor, step = self.predictor, self.step
+        previous = self.source
+        self.source = np.r_[previous[1:], step].astype(np.int32)
+        if not self.advance_rgb:
+            self.source[:self.rgb_size] = previous[:self.rgb_size]
+        occupied = ~predictor.temporal_mask[:self.n].cpu().numpy()
+        rgb = np.asarray(self.new_rgb)[self.source.clip(min=0)]
+        occluded = self.gt_occluded[self.source.clip(min=0)].T
+        states = np.where(occluded, 3, np.where(rgb, 1, 2))
+        states = np.where(occupied, states, 0).astype(np.uint8)
+        self.slot_states.append(states)
+        self.sources.append(self.source.copy())
+        self.positions.append(positions[:self.n].float().cpu().numpy())
+        self.probabilities.append(self.probability)
+        if score_index is not None:
+            self.score_steps.append(step)
+        visible = visible[:self.n].cpu().numpy()
+        for point in range(self.n):
+            self.rows.append(dict(
+                step=step, rgb_frame=int(rgb_index), scored=score_index is not None, point=point,
+                gt_occluded=bool(self.gt_occluded[step, point]),
+                visibility_probability=float(self.probability[point]), visible=bool(visible[point]),
+                x=float(self.positions[-1][point, 0]), y=float(self.positions[-1][point, 1]),
+                read_slots=int(self.read_count[point]),
+                read_occluded_origin_slots=int(self.read_occluded[point]),
+                filled_rgb_slots=int(occupied[point, :self.rgb_size].sum()),
+                filled_recent_slots=int(occupied[point, self.rgb_size:].sum()),
+            ))
+
+    def finish(self):
+        self.handle.remove()
+
+    def arrays(self):
+        return dict(mode="baseline", rgb_size=self.rgb_size, score_steps=np.asarray(self.score_steps),
+                    gt_occluded=self.gt_occluded, positions=np.asarray(self.positions),
+                    probability=np.asarray(self.probabilities), slot_states=np.asarray(self.slot_states),
+                    source_steps=np.asarray(self.sources),
+                    new_rgb=np.asarray(self.new_rgb))
+
+
 @torch.no_grad()
 def predict_sequence(predictor, sequence, device, support_grid_size, amp, event_stream=None,
-                     local_support_radius=0, rgb_keep_every=1, input_stats=None):
+                     local_support_radius=0, rgb_keep_every=1, input_stats=None, diagnostic=None):
     """Stream RGB/event steps, retaining predictions at annotated RGB times."""
     predictor.reset()
     if support_grid_size < 0 or local_support_radius < 0:
@@ -147,10 +218,14 @@ def predict_sequence(predictor, sequence, device, support_grid_size, amp, event_
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         start = time.perf_counter()
+        if diagnostic is not None:
+            diagnostic.before_step(t, new_rgb)
         with autocast:
             positions, visible = predictor.forward_frame(
                 frame, new_queries=queries, events=event_tensor, img_ifnew=new_rgb,
             )
+        if diagnostic is not None:
+            diagnostic.after_step(positions, visible, score_index, event_stream.rgb_indices[t])
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         elapsed += time.perf_counter() - start
@@ -181,6 +256,8 @@ def predict_sequence(predictor, sequence, device, support_grid_size, amp, event_
 
 
 def tracking_metrics(sequence, tracks, visible, frame_indices=None):
+    from utils.eval_utils import compute_tapvid_metrics
+
     # Retain the original query frame so "first" excludes only initialization.
     indices = (np.arange(len(tracks)) if frame_indices is None else
                np.r_[0, np.asarray(frame_indices)[np.asarray(frame_indices) > 0]])
@@ -209,12 +286,175 @@ def evaluate_sequence(predictor, sequence, device, support_grid_size, amp, event
     return tracking_metrics(sequence, tracks, visible), seconds_per_frame, tracks, visible
 
 
+def memory_diagnostic_metrics(sequence, tracks, visible):
+    """Score false visibility separately from localization at GT-visible RGB times."""
+    rows = []
+    errors = np.linalg.norm(tracks - sequence.tracks, axis=-1)
+    for point in range(tracks.shape[1]):
+        occluded = sequence.occluded[:, point].copy()
+        occluded[0] = False
+        false = occluded & visible[:, point]
+        edges = np.diff(np.r_[False, false, False].astype(int))
+        lengths = np.flatnonzero(edges == -1) - np.flatnonzero(edges == 1)
+        reappearances = false & ~np.r_[True, visible[:-1, point]]
+        indices = np.flatnonzero(false)
+        scored_visible = ~sequence.occluded[:, point]
+        scored_visible[0] = False
+        rows.append(dict(
+            point=point, occluded_frames=int(occluded.sum()), false_visible_frames=int(false.sum()),
+            first_false_visible_frame=int(indices[0]) if len(indices) else None,
+            false_reappearances=int(reappearances.sum()),
+            longest_false_run=int(lengths.max()) if len(lengths) else 0,
+            gt_visible_mean_error_px=float(errors[scored_visible, point].mean())
+            if scored_visible.any() else None,
+        ))
+    false_count = sum(row["false_visible_frames"] for row in rows)
+    occluded_count = sum(row["occluded_frames"] for row in rows)
+    return dict(false_visible_frames=false_count, occluded_frames=occluded_count,
+                false_visible_rate=false_count / occluded_count if occluded_count else None,
+                points=rows)
+
+
+def diagnose_localization(sequence, tracks, visible, arrays, target, visibility_threshold):
+    """Label inaccurate RGB writes using GT; leave event-step localization unscored."""
+    error_threshold = 8.0  # One of the existing pixel thresholds; raw errors are also retained.
+    errors = np.linalg.norm(tracks - sequence.tracks, axis=-1)
+    errors[sequence.occluded] = np.nan
+    errors[0] = np.nan  # Exclude initialization, as in the existing evaluation.
+    probability = arrays["probability"][arrays["score_steps"]]
+    bad = np.isfinite(errors) & (errors > error_threshold)
+    step_bad = np.zeros_like(arrays["gt_occluded"], dtype=bool)
+    step_bad[arrays["score_steps"]] = bad
+    states = arrays["slot_states"].copy()
+    bad_sources = step_bad[arrays["source_steps"].clip(min=0)].transpose(0, 2, 1)
+    states[(states == 1) & bad_sources] = 4
+    arrays.update(slot_states=states, localization_error_px=errors, error_threshold_px=error_threshold)
+    points = []
+    with open(target / "localization.csv", "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=("frame", "step", "point", "gt_visible", "error_px",
+                                                "visibility_probability", "pred_visible", "inaccurate_rgb_write"))
+        writer.writeheader()
+        for frame in range(len(tracks)):
+            for point in range(tracks.shape[1]):
+                writer.writerow(dict(frame=frame, step=int(arrays["score_steps"][frame]), point=point,
+                                     gt_visible=not bool(sequence.occluded[frame, point]),
+                                     error_px=float(errors[frame, point]) if np.isfinite(errors[frame, point]) else None,
+                                     visibility_probability=float(probability[frame, point]),
+                                     pred_visible=bool(visible[frame, point]),
+                                     inaccurate_rgb_write=bool(bad[frame, point])))
+    for point in range(tracks.shape[1]):
+        bad_frames = np.flatnonzero(bad[:, point])
+        occluded = np.flatnonzero(sequence.occluded[:, point])
+        first_occluded = int(occluded[0]) if len(occluded) else None
+        count = len(bad_frames)
+        points.append(dict(
+            point=point, inaccurate_visible_frames=count,
+            inaccurate_pred_visible_frames=int((bad[:, point] & visible[:, point]).sum()),
+            first_inaccurate_frame=int(bad_frames[0]) if count else None,
+            first_occluded_frame=first_occluded,
+            inaccurate_frames_before_first_occlusion=int((bad_frames < first_occluded).sum())
+            if first_occluded is not None else count,
+            mean_visibility_on_inaccurate=float(probability[bad[:, point], point].mean()) if count else None,
+        ))
+    render_localization_timeline(sequence, errors, probability, target / "localization_timeline.png",
+                                 error_threshold, visibility_threshold)
+    return dict(error_threshold_px=error_threshold, visibility_threshold=visibility_threshold,
+                gt_visible_scored_frames=int(np.isfinite(errors).sum()),
+                inaccurate_visible_frames=int(bad.sum()),
+                inaccurate_pred_visible_frames=int((bad & visible).sum()), points=points)
+
+
+def run_memory_diagnostics(predictor, config, sequence_name, device, output_dir,
+                           prediction_dir=None, visibility_threshold=0.8):
+    if prediction_dir is None:
+        from model.rgb_memory_predictor import RGBMemoryPredictor
+
+        if not isinstance(predictor, RGBMemoryPredictor) or (predictor.recent_size, predictor.rgb_size) != (24, 48):
+            raise ValueError("Memory diagnostics require the legacy recent_rgb 24+48 policy")
+    if config.get("input_mode") != "frame_event":
+        raise ValueError("Memory diagnostics require frame_event input")
+    selected = False
+    for dataset, names in config["sequences"].items():
+        for name in names:
+            if sequence_name and name != sequence_name:
+                continue
+            selected = True
+            sequence = load_real_tap_sequence(resolve_path(config["dataset_root"]), dataset, name,
+                                             config.get("drivtap_gt_mode", "downsample_even"))
+            sequence_dir = output_dir / f"{dataset}_{name}"
+            sequence_dir.mkdir(parents=True, exist_ok=True)
+            if prediction_dir is not None:
+                source = prediction_dir / f"{dataset}_{name}" / "baseline" / "diagnostic.npz"
+                with np.load(source) as saved:
+                    arrays = {key: saved[key] for key in saved.files}
+                tracks, visible = arrays.pop("tracks"), arrays.pop("visibility")
+                with open(source.parent.parent / "summary.json", encoding="utf-8") as file:
+                    previous = json.load(file)
+                previous_baseline = previous["baseline"] if "baseline" in previous else previous["modes"]["baseline"]
+                seconds = None
+                print(f"Baseline diagnostic from saved predictions: {source}", flush=True)
+            else:
+                dt = config.get("event_dt", {}).get(dataset, "auto")
+                stream = load_real_tap_event_stream(sequence, dt[name] if isinstance(dt, dict) else dt)
+                diagnostic = MemoryDiagnostic(predictor, sequence, stream)
+                print(f"Baseline memory diagnostic: {dataset}/{name}", flush=True)
+                try:
+                    tracks, visible, seconds = predict_sequence(
+                        predictor, sequence, device, int(config.get("support_grid_size", 20)),
+                        bool(config.get("amp", True)), stream,
+                        local_support_radius=float(config.get("local_support_radius", 0)),
+                        diagnostic=diagnostic,
+                    )
+                finally:
+                    diagnostic.finish()
+                arrays = diagnostic.arrays()
+            metrics = previous_baseline["metrics"] if prediction_dir is not None else tracking_metrics(sequence, tracks, visible)
+            row = memory_diagnostic_metrics(sequence, tracks, visible)
+            row.update(metrics=metrics, seconds_per_rgb=seconds)
+            prediction_config = previous["config"] if prediction_dir is not None else config
+            checkpoint = previous["checkpoint"] if prediction_dir is not None else config["checkpoint"]
+            diagnostic_threshold = visibility_threshold
+            if prediction_dir is not None:
+                diagnostic_threshold = previous.get("localization", {}).get("visibility_threshold", visibility_threshold)
+            summary = dict(checkpoint=checkpoint, config=prediction_config,
+                           gt_between_rgb="latest RGB label held until next RGB",
+                           slot_order="older RGB oldest->newest, then recent oldest->newest",
+                           baseline=row)
+            target = sequence_dir / "baseline"
+            target.mkdir(exist_ok=True)
+            if prediction_dir is None:
+                np.savez_compressed(target / "diagnostic.npz", tracks=tracks, visibility=visible, **arrays)
+                with open(target / "point_steps.csv", "w", newline="", encoding="utf-8") as file:
+                    writer = csv.DictWriter(file, fieldnames=list(diagnostic.rows[0]))
+                    writer.writeheader()
+                    writer.writerows(diagnostic.rows)
+            else:
+                summary["prediction_source"] = str(source)
+            summary["localization"] = diagnose_localization(
+                sequence, tracks, visible, arrays, target, diagnostic_threshold)
+            vis = config.get("visualization", {})
+            render_tracking_video(sequence, tracks, visible, target / "tracking.mp4",
+                                  fps=vis.get("fps", 10), trail_length=vis.get("trail_length", 8),
+                                  max_width=vis.get("max_width", 960),
+                                  gt_tracks=sequence.tracks, gt_visible=~sequence.occluded,
+                                  memory_diagnostic=arrays)
+            with open(sequence_dir / "summary.json", "w", encoding="utf-8") as file:
+                json.dump(summary, file, indent=2)
+            print(f"{name}/baseline: AJ={metrics['average_jaccard'] * 100:.2f}, "
+                  f"false visible={row['false_visible_frames']}/{row['occluded_frames']}", flush=True)
+    if not selected:
+        raise ValueError(f"Sequence {sequence_name!r} is absent from the config")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="config/test_tapformer_real.yaml")
     parser.add_argument("--sequence", help="Evaluate one named sequence from the YAML config")
     parser.add_argument("--rgb-keep-every", type=int, help="Keep every K RGB arrivals; events and GT remain")
     parser.add_argument("--output-dir", help="Override the output directory")
+    parser.add_argument("--memory-diagnostic", action="store_true",
+                        help="Observe baseline memory slots and save per-point traces without changing predictions")
+    parser.add_argument("--diagnostic-from", help="Reuse a saved diagnostic output directory; skip model inference")
     args = parser.parse_args()
     config = load_config(resolve_path(args.config))
     rgb_keep_every = (args.rgb_keep_every if args.rgb_keep_every is not None
@@ -233,7 +473,19 @@ def main():
         with open(model_config_path, encoding="utf-8") as file:
             model_args = Namespace(**json.load(file)["args"])
     else:
-        model_args = load_args_from_yaml(str(model_config_path))
+        with open(model_config_path, encoding="utf-8") as file:
+            model_args = Namespace(**yaml.safe_load(file))
+    if args.diagnostic_from:
+        if not args.memory_diagnostic or frequency_test:
+            raise ValueError("--diagnostic-from requires --memory-diagnostic with the original RGB frequency")
+        output_dir = resolve_path(args.output_dir) if args.output_dir else resolve_path(config["output_dir"]) / "localization_diagnostic"
+        run_memory_diagnostics(None, config, args.sequence, None, output_dir,
+                               prediction_dir=resolve_path(args.diagnostic_from),
+                               visibility_threshold=model_args.delta_v)
+        return
+    from model.rgb_memory_predictor import RGBMemoryPredictor
+    from model.trackon_predictor import Predictor
+
     dual_memory = getattr(model_args, "rgb_memory_size", 0) > 0
     default_size = model_args.M + model_args.rgb_memory_size if dual_memory else getattr(model_args, "M_i", 72)
     memory_size = int(config.get("inference_memory_size", default_size))
@@ -268,6 +520,13 @@ def main():
     if frequency_test and args.output_dir is None:
         output_dir /= f"k{rgb_keep_every}"
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.memory_diagnostic:
+        if frequency_test:
+            raise ValueError("Run memory diagnostics with the original RGB frequency")
+        diagnostic_dir = output_dir if args.output_dir else output_dir / "memory_diagnostic"
+        run_memory_diagnostics(predictor, config, args.sequence, device, diagnostic_dir,
+                               visibility_threshold=predictor.delta_v)
+        return
     if frequency_test:
         config["rgb_keep_every"] = rgb_keep_every
         if args.sequence:
@@ -348,15 +607,26 @@ def main():
             vis_cfg = config.get("visualization", {})
             if vis_cfg.get("enabled", False):
                 video_format = vis_cfg.get("format", "mp4")
-                video_path, preview_path = render_tracking_video(
-                    sequence, tracks, visible, output_dir / "videos" / f"{dataset}_{name}.{video_format}",
+                video_options = dict(
                     fps=vis_cfg.get("fps", 10), trail_length=vis_cfg.get("trail_length", 8),
                     max_width=vis_cfg.get("max_width", 960),
                     gt_tracks=sequence.tracks, gt_visible=~sequence.occluded,
                 )
+                video_path, preview_path = render_tracking_video(
+                    sequence, tracks, visible, output_dir / "videos" / f"{dataset}_{name}.{video_format}",
+                    **video_options,
+                )
                 row["video_path"] = str(video_path)
                 row["preview_path"] = str(preview_path)
                 print(f"Video saved to {video_path}; preview saved to {preview_path}", flush=True)
+                if vis_cfg.get("show_events", False):
+                    event_video, event_preview = render_tracking_video(
+                        sequence, tracks, visible,
+                        output_dir / "videos" / f"{dataset}_{name}_rgb_event.{video_format}",
+                        event_stream=event_stream, **video_options,
+                    )
+                    row.update(rgb_event_video_path=str(event_video), rgb_event_preview_path=str(event_preview))
+                    print(f"RGB/event video saved to {event_video}; preview saved to {event_preview}", flush=True)
             rows.append(row)
             print(f"{dataset}/{name}: AJ={metrics['average_jaccard'] * 100:.2f} "
                   f"delta_avg={metrics['average_pts_within_thresh'] * 100:.2f} "

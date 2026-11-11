@@ -1,0 +1,57 @@
+# ERF fine-tuned recurrent FE; score GT at every original RGB timestamp.
+# Continuous event caches, normal RGB arrivals, and the existing 24+48 policy.
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+input_mode: frame_event
+# Same architecture as FT; this config also supplies the original delta_v=0.8.
+# model_config: config/train_frame_event_real_ft.yaml
+# checkpoint: outputs/frame_event_real_ft/20261031_213525_985288/best_pseudo.pt
+# output_dir: outputs/real_tapformer_frame_event_ft/20261031_213525_985288_local_support8
+
+# model_config: config/train_frame_event_erf_dsec_ft.yaml
+# checkpoint: outputs/frame_event_erf_dsec_ft/20261107_023307_629990/best_pseudo.pt
+# output_dir: outputs/real_tapformer_frame_event_dsec_ft/20261107_023307_629990_local_support8
+
+# model_config: config/train_frame_event_erf_dsec_ft.yaml
+# checkpoint: outputs/frame_event_erf_dsec_ft/20261108_190932_820367/best_pseudo.pt
+# output_dir: outputs/real_tapformer_frame_event_dsec_ft/20261108_190932_820367_local_support8
+
+model_config: config/train_frame_event_erf_dsec_multifrequency_ft.yaml
+checkpoint: outputs/frame_event_erf_dsec_multifrequency_ft/20261110_123648_908699/best_pseudo.pt
+output_dir: outputs/real_tapformer_frame_event_multifreq/20261110_123648_908699_local_support8
+
+csv_filename: summary.csv
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+event_dt:
+  InivTAP: rgb_aligned_20ms_max6
+  DrivTAP: rgb_aligned_2
+drivtap_gt_mode: downsample_even
+support_grid_size: 0
+local_support_radius: 8
+inference_memory_size: 72
+memory_policy:
+  type: recent_rgb
+  recent_size: 24
+  rgb_size: 48
+device: cuda:0
+amp: true
+save_predictions: false
+visualization:
+  enabled: true
+  show_events: true  # Also save RGB GT | RGB prediction | event prediction videos.
