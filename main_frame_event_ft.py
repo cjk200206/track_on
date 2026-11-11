@@ -37,6 +37,7 @@ from dataset.frame_event_mixed import MixedFrameEventDataset, MixedFrameEventSam
 from model.loss import Loss_Function
 from utils.tensorboard_utils import FrameEventTensorBoard
 from utils.train_utils import get_scheduler, load_args_from_yaml, load_pretrained_weights
+from utils.memory_training import build_ft_optimizer, MemoryTrainingSchedule, training_clip
 
 
 class RealFineTuneLoss(Loss_Function):
@@ -354,8 +355,11 @@ def evaluate(model, loader, args, device, weights=None):
 
 def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, logger):
     raw_model = model.module if isinstance(model, DistributedDataParallel) else model
-    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.lr, weight_decay=args.wd)
+    # Register all originally trainable parameters before temporarily freezing FE.
+    # DDP is also constructed before freezing, with dynamic unused-parameter detection.
+    optimizer = build_ft_optimizer(raw_model, args)
     scheduler = get_scheduler(args, optimizer, loader, warmup=False)
+    stages = MemoryTrainingSchedule(raw_model, args)
     scaler = torch.GradScaler(enabled=args.amp)
     loss_fn = RealFineTuneLoss(args)
     mixed = getattr(args, "syn_real_training", False)
@@ -397,6 +401,9 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
             mix = args.sampling_weights if source_names else "synthetic:real=1:1"
             print(f"Mixing {mix}; synthetic losses=7, real losses=5; "
                   f"linear loss-weight schedule={getattr(args, 'schedule_syn_weight', False)}", flush=True)
+        print(f"Adaptation: {stages.steps} successful updates, T={stages.length}; "
+              f"joint T={args.T}; recent/RGB memory={raw_model.M}/{raw_model.rgb_memory_size}", flush=True)
+    previous_phase = None
     for epoch in range(start_epoch, args.epoch_num):
         if cli.max_steps is not None and steps >= cli.max_steps:
             break
@@ -417,7 +424,14 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                 if not (raw_batch["source_id"] == source_id).all():
                     raise ValueError("FT expects each microbatch to contain one data source")
             syn_weight, real_weight = mixture_weights(args, epoch, batch_index, len(loader))
-            batch = move_batch(raw_batch, device)
+            length = stages.apply(successful_updates)
+            phase = stages.phase(successful_updates)
+            if phase != previous_phase:
+                if rank == 0:
+                    print(f"Training phase: {phase}, successful_updates={successful_updates}, T={length}", flush=True)
+                previous_phase = phase
+            # Slice before device transfer so the adaptation phase uses less VRAM.
+            batch = move_batch(training_clip(raw_batch, length), device)
             clip_length = batch["video"].shape[1]
             window_start = batch_index // args.grad_accum_steps * args.grad_accum_steps
             window_size = min(args.grad_accum_steps, len(loader) - window_start)
@@ -514,7 +528,8 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                 mixture[f"{prefix}/loss"] = means[metric_offset + index] / batches if batches else None
                 mixture[f"{prefix}/fraction"] = fraction / source_fraction if source_fraction else None
             training_metrics = {**mixture, "successful_updates": successful_updates,
-                                "clip_length": clip_length}
+                                "adaptation": int(phase == "adaptation"), "clip_length": clip_length,
+                                "memory_lr": optimizer.param_groups[-1]["lr"]}
             logger.training(steps, loss=means[0], components=components,
                             lr=optimizer.param_groups[0]["lr"], epoch=epoch + 1, grad_norm=norm,
                             optimizer_updated=updated, amp_scale=scaler.get_scale(), microbatches=window_size,
@@ -523,7 +538,7 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                 record = {"epoch": epoch + 1, "step": steps, "loss": means[0],
                           "components": components, "lr": optimizer.param_groups[0]["lr"],
                           "optimizer_updated": updated, "grad_norm_before_clip": float(norm),
-                          "amp_scale": scaler.get_scale(),
+                          "amp_scale": scaler.get_scale(), "phase": phase,
                           "successful_updates": successful_updates, "clip_length": clip_length}
                 if mixture:
                     record["mixture"] = mixture
@@ -552,7 +567,7 @@ def train(model, loader, val_loader, args, cli, device, rank, run_dir, split, lo
                      "epoch": epoch + int(complete), "batch_in_epoch": 0 if complete else next_batch,
                      "step": steps, "best_pseudo_error_px": best_error, "config": vars(args), "split": split,
                      "batches_per_epoch": len(loader), "world_size": world_size}
-            state.update(successful_updates=successful_updates)
+            state.update(successful_updates=successful_updates, phase=stages.phase(successful_updates))
             paths = [run_dir / "last.pt"]
             if improved:
                 paths.append(run_dir / "best_pseudo.pt")
@@ -622,6 +637,11 @@ def main():
             real_source_args(args, source)
     if args.event_fusion_type != "recurrent" or args.event_channels != 10:
         raise ValueError("This entry expects the recurrent 10-channel FE model")
+    if (int(getattr(args, "adaptation_steps", 0)) < 0
+            or not 2 <= int(getattr(args, "adaptation_T", args.T)) <= args.T
+            or not math.isfinite(float(getattr(args, "memory_lr", args.lr)))
+            or float(getattr(args, "memory_lr", args.lr)) <= 0):
+        raise ValueError("Invalid memory learning rate or adaptation schedule")
     if cli.output_dir:
         args.output_dir = cli.output_dir
     rank, world_size = int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))

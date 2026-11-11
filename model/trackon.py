@@ -13,6 +13,7 @@ from model.prediction_head import Prediction_Head
 from model.reranking import Rerank_Module
 from model.trajectory_history import TrajectoryHistoryScorer, trajectory_entry
 from model.candidate_history import CandidateHistoryScorer
+from model.point_memory import PointMemory, RGBMemoryReader, read_memory, resize_time_embedding
 
 from utils.coord_utils import indices_to_coords
 
@@ -79,16 +80,62 @@ class Track_On2(nn.Module):
                 self.D, self.input_size,
                 hidden_dim=int(getattr(args, "candidate_score_dim", 64)),
                 num_layers=int(getattr(args, "candidate_score_layers", 2)), num_heads=nhead)
+        if getattr(args, "memory_reliability_weighting", False) or self.candidate_scorer is not None:
             self.memory_reliability = nn.Linear(2, nhead)
             nn.init.zeros_(self.memory_reliability.weight)
             nn.init.zeros_(self.memory_reliability.bias)
-        self.uses_history = self.trajectory_scorer is not None or self.candidate_scorer is not None
+        self.uses_history = (self.trajectory_scorer is not None or self.candidate_scorer is not None
+                             or self.memory_reliability is not None)
+        rgb_size = getattr(args, "rgb_memory_size", 0)
+        if type(rgb_size) is not int or rgb_size < 0:
+            raise ValueError("rgb_memory_size must be a nonnegative integer")
+        self.rgb_memory_reader = (RGBMemoryReader(self.memory_attention, self.t_embedding, rgb_size, self.D)
+                                  if rgb_size else None)
+
+    @property
+    def rgb_memory_size(self):
+        return self.rgb_memory_reader.size if self.rgb_memory_reader is not None else 0
+
+    @property
+    def pretrained_memory_prefixes(self):
+        return (("memory_reliability.",) if self.memory_reliability is not None else ()) + (
+            ("rgb_memory_reader.",) if self.rgb_memory_reader is not None else ())
+
+    def initialize_missing_memory(self, missing):
+        """Only whole new components may be absent from an older checkpoint."""
+        keys = set(self.state_dict())
+        for prefix in self.pretrained_memory_prefixes:
+            expected = {key for key in keys if key.startswith(prefix)}
+            absent = expected.intersection(missing)
+            if absent and absent != expected:
+                raise RuntimeError(f"Incomplete memory component in checkpoint: {prefix}")
+            if absent and prefix == "rgb_memory_reader.":
+                self.rgb_memory_reader.initialize_from(self.memory_attention, self.t_embedding)
+
+    def _decode_queries(self, query, features, bank, rgb_bank=None, p_mask=0):
+        """Share causal decoding between training, online and streamed inference."""
+        memory = bank.values
+        bias = self._memory_bias(bank.history)
+        rgb_memory = None if rgb_bank is None else rgb_bank.values
+        rgb_bias = None if rgb_bank is None else self._memory_bias(rgb_bank.history)
+        for index in range(self.decoder_layer_num):
+            query = self.feature_attention[index](query, features, features)
+            query = self.query_attention[index](query, query, query)
+            recent, memory = read_memory(self.memory_attention[index], query, memory, bank.mask,
+                                         self.t_embedding, bias, p_mask)
+            if rgb_bank is not None:
+                rgb, rgb_memory = self.rgb_memory_reader.read(
+                    index, query, rgb_memory, rgb_bank.mask, rgb_bias, p_mask)
+                query = self.rgb_memory_reader.fuse(index, recent, rgb, rgb_bank.mask)
+            else:
+                query = recent
+        return self.projection1(query)
 
     def _memory_bias(self, history):
         if self.memory_reliability is None:
             return None
         if history is None:
-            raise ValueError("history_candidate_scoring requires synchronized xy/v/u history")
+            raise ValueError("Memory weighting requires synchronized xy/v/u history")
         bias = self.memory_reliability(history[..., 2:].detach()).transpose(1, 2)
         return F.pad(bias, (0, 1))  # The current query has no reliability bias.
 
@@ -134,14 +181,9 @@ class Track_On2(nn.Module):
     def memory_extension(self, new_memory_size):
         if self.trajectory_scorer is not None and new_memory_size < self.trajectory_scorer.history_size:
             raise ValueError("Inference memory must contain at least trajectory_history_size slots")
-        pos_embedding = self.t_embedding.clone()  # (1, self.memory_size + 1, self.embedding_dim)
-        pos_embedding_past = pos_embedding[:, :-1]
-        pos_embedding_now = pos_embedding[:, -1].unsqueeze(dim=1)  # (1, 1, self.embedding_dim)
-        
-        pos_embedding_past = pos_embedding_past.permute(0, 2, 1)
-        pos_embedding_interpolated = F.interpolate(pos_embedding_past, size=new_memory_size, mode='linear', align_corners=True)
-        pos_embedding_interpolated = pos_embedding_interpolated.permute(0, 2, 1)
-        self.t_embedding = nn.Parameter(torch.cat([pos_embedding_interpolated, pos_embedding_now], dim=1))
+        if type(new_memory_size) is not int or new_memory_size < 1:
+            raise ValueError("Memory size must be a positive integer")
+        self.t_embedding = nn.Parameter(resize_time_embedding(self.t_embedding.detach(), new_memory_size))
 
         self.M = new_memory_size
         
@@ -189,6 +231,12 @@ class Track_On2(nn.Module):
         # :args gt_tracks: (B, T, N, 2) in range [0, H_in] and [0, W_in]
         # :args queries: (B, N, 3) where 3 is (t, x, y) in range [0, 255]
         B, T, _, H_in, W_in = video.shape
+        if self.rgb_memory_reader is not None and events is not None and img_ifnew is None:
+            raise ValueError("Dual FE memory requires explicit img_ifnew")
+        rgb_arrivals = (torch.ones(B, T, device=video.device, dtype=torch.bool) if img_ifnew is None
+                        else torch.as_tensor(img_ifnew, device=video.device, dtype=torch.bool))
+        if rgb_arrivals.shape != (B, T):
+            raise ValueError("img_ifnew must have shape (B, T)")
         M = self.M
         D = self.D
         N = queries.shape[1]                        # Number of queries
@@ -215,7 +263,7 @@ class Track_On2(nn.Module):
         # === === ===
 
         # == Feature Projection ==
-        f4, f8, f16, f32 = self._backbone_features(video, events=events, img_ifnew=img_ifnew)  # (B, T, P_s, D)
+        f4, f8, f16, f32 = self._backbone_features(video, events=events, img_ifnew=img_ifnew)
         f_fused = self.fpn(f4, f8, f16, f32)                              # (B, T, P, D)
         # === === ===
 
@@ -242,12 +290,9 @@ class Track_On2(nn.Module):
                 query_init[b, idxs] = centers                                                                      # (N_t, D)
             # === === ===
 
-        # === Memory initialization ===
-        point_memory = torch.zeros(B, N, M, D, device=device)                             # (B, N, M, D)
-        temporal_mask = torch.ones(B, N, M, device=device, dtype=torch.bool)              # True if masked, (B, N, M)
-        trajectory_history = (torch.zeros(B, N, M, 4, device=device)
-                              if self.uses_history else None)
-        # === === ===
+        memories = [PointMemory.empty(query_init, N, M, D, self.uses_history) for _ in range(B)]
+        rgb_memories = ([PointMemory.empty(query_init, N, self.rgb_memory_size, D, self.uses_history)
+                         for _ in range(B)] if self.rgb_memory_reader is not None else None)
 
         # === Output initialization ===
         C1 = torch.zeros(B, T, N, self.P, device=device)                        # (B, T, N, P)
@@ -280,10 +325,9 @@ class Track_On2(nn.Module):
                     print(f"Warning: No available queries at time {t} for batch {b}. Skipping.")
                     continue
                 
-                memory_mask_t = temporal_mask[b, available_queries]                # (N_t, M)
-                history_t = None if trajectory_history is None else trajectory_history[b, available_queries]
-                memory = point_memory[b, available_queries].clone()              # (N_t, M, D)
-                memory_bias = self._memory_bias(history_t)
+                bank = memories[b].select(available_queries)
+                memory_mask_t, history_t = bank.mask, bank.history
+                rgb_bank = None if rgb_memories is None else rgb_memories[b].select(available_queries)
                 
                 q_t = query_init[b, available_queries].clone().unsqueeze(0)      # (1, N_t, D)
 
@@ -293,33 +337,7 @@ class Track_On2(nn.Module):
                 f16_t = f16[b, t].unsqueeze(0)                                   # (1, P // 16, D)
                 f32_t = f32[b, t].unsqueeze(0)                                   # (1, P // 64, D)
 
-                # === Query Decoder ===
-                for i in range(self.decoder_layer_num):
-
-                    # === Attention to frame features ===
-                    q_t = self.feature_attention[i](q_t,  f_fused_t, f_fused_t)         # (1, N_t, D)
-                    # === === ===
-
-                    # === Attention to other queries ===
-                    q_t = self.query_attention[i](q_t, q_t, q_t)        # (1, N_t, D)
-                    # === === ===
-
-                    # === Attention to memory ===
-                    q_t = q_t.view(N_t, 1, D)                                      # (N, 1, D)
-
-                    memory_mask_noised = memory_mask_t | (torch.rand_like(memory_mask_t.float(), device=device) < p_mask)  # random masking
-                    qkv = torch.cat([memory, q_t], dim=1)                                                           # (N_t, M + 1, D)
-                    mask = torch.cat([memory_mask_noised, torch.zeros(N_t, 1, device=device).bool()], dim=1)        # (N_t, M + 1)
-
-
-                    qkv = self.memory_attention[i](qkv + self.t_embedding, qkv + self.t_embedding,
-                                                  qkv, mask, attention_bias=memory_bias)
-
-                    q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N_t, D)
-                    memory = qkv[:, :-1]                                            # (N_t, M, D)
-                    # === === ===
-
-                q_t = self.projection1(q_t)
+                q_t = self._decode_queries(q_t, f_fused_t, bank, rgb_bank, p_mask=p_mask)
                 # === === ===
 
                 # === Re-ranking ===
@@ -330,7 +348,7 @@ class Track_On2(nn.Module):
                 q_t = self.projection2(q_t)                                                             # (1, N_t, D)
                 p_patch, o, v_logit, u_logit, c2, candidates = self._predict_position(
                     q_t, (f4_t, f8_t, f16_t, f32_t), p_patch_top_k, s_logit_top_k,
-                    point_memory[b, available_queries].clone(), history_t, memory_mask_t)
+                    bank.values, history_t, memory_mask_t)
                 # === === ===
 
                 C1[b, t, available_queries] = c1.squeeze(0).float()         # (1, N_t, P) 
@@ -349,20 +367,11 @@ class Track_On2(nn.Module):
                 S_logit_top_k[b, t, available_queries] = s_logit_top_k.squeeze(0).float()      # (N, K)
                 P_patch_top_k[b, t, available_queries] = p_patch_top_k.squeeze(0).float()      # (N, K, 2)
 
-                # === Updates ===
-                # Update Memory
-                point_memory_slice = torch.zeros(N, 1, D, device=device, dtype=q_t.dtype)  # (N, 1, D)
-                point_memory_slice[available_queries] = q_t.clone().view(N_t, 1, D)
-                point_memory[b] = torch.cat([point_memory[b, :, 1:], point_memory_slice], dim=1)                # (N, M, D)
-
-                if trajectory_history is not None:
-                    history_slice = trajectory_history.new_zeros(N, 1, 4)
-                    history_slice[available_queries, 0] = trajectory_entry(
-                        p_patch[0] + o[-1], v_logit, u_logit, self.input_size)
-                    trajectory_history[b] = torch.cat((trajectory_history[b, :, 1:], history_slice), dim=1)
-
-                # Update Temporal Mask
-                temporal_mask[b] = torch.cat([temporal_mask[b, :, 1:], ~available_queries.view(N, 1)], dim=1)   # (N, M)
+                entry = (trajectory_entry(p_patch[0] + o[-1], v_logit, u_logit, self.input_size)
+                         if self.uses_history else None)
+                memories[b] = memories[b].append(q_t[0], entry, available_queries)
+                if rgb_memories is not None and rgb_arrivals[b, t]:
+                    rgb_memories[b] = rgb_memories[b].append(q_t[0], entry, available_queries)
 
             
         # P = indices_to_coords(torch.argmax(C1.detach(), dim=-1), self.input_size, self.stride)   # (B, T, N, 2), in range [H, W]
@@ -380,7 +389,6 @@ class Track_On2(nn.Module):
         if C2 is not None:
             out["C2"] = C2
         out.update(candidate_outputs)
-        
 
         return out
     
@@ -410,12 +418,9 @@ class Track_On2(nn.Module):
         query_coords_norm = queries[..., 1:].clone()                # (B, N, 2)
         query_coords_norm  = query_coords_norm * 2 - 1              # (B, N, 2), in range [-1, 1]
 
-        # === Memory initialization ===
-        point_memory = torch.zeros(B, N, M, D, device=device)                             # (B, N, M, D)
-        temporal_mask = torch.ones(B, N, M, device=device, dtype=torch.bool)              # True if masked, (B, N, M)
-        trajectory_history = (torch.zeros(B, N, M, 4, device=device)
-                              if self.uses_history else None)
-        # === === ===
+        memories = [PointMemory.empty(query_init, N, M, D, self.uses_history) for _ in range(B)]
+        rgb_memories = ([PointMemory.empty(query_init, N, self.rgb_memory_size, D, self.uses_history)
+                         for _ in range(B)] if self.rgb_memory_reader is not None else None)
 
         # === Output initialization ===
         V_logit = torch.zeros(B, T, N, device=device)      # (B, T, N)
@@ -432,10 +437,9 @@ class Track_On2(nn.Module):
                 if N_t == 0:
                     continue
                 
-                memory_mask_t = temporal_mask[b, available_queries]                # (N_t, M)
-                history_t = None if trajectory_history is None else trajectory_history[b, available_queries]
-                memory = point_memory[b, available_queries].clone()                # (N_t, M, D)
-                memory_bias = self._memory_bias(history_t)
+                bank = memories[b].select(available_queries)
+                memory_mask_t, history_t = bank.mask, bank.history
+                rgb_bank = None if rgb_memories is None else rgb_memories[b].select(available_queries)
 
                 # === Visual Backbone Feedforward ===
                 f4_t, f8_t, f16_t, f32_t = self._backbone_features(video[b, t].unsqueeze(0).unsqueeze(0))     # (1, 1, P, D), (1, 1, P // 4, D), (1, 1, P // 16, D), (1, 1, P // 64, D)
@@ -465,32 +469,7 @@ class Track_On2(nn.Module):
                 q_t = query_init[b, available_queries].clone().unsqueeze(0)      # (1, N_t, D)
 
 
-                # === Query Decoder ===
-                for i in range(self.decoder_layer_num):
-                    # === Attention to frame features ===
-                    q_t = self.feature_attention[i](q_t, 
-                                                f_fused_t, 
-                                                f_fused_t)         # (1, N_t, D)
-                    # === === ===
-
-                    # === Attention to other queries ===
-                    q_t = self.query_attention[i](q_t, q_t, q_t)        # (1, N_t, D)
-                    # === === ===
-
-                    # === Attention to memory ===
-                    q_t = q_t.view(N_t, 1, D)                                      # (N, 1, D)
-
-                    qkv = torch.cat([memory, q_t], dim=1)                                                      # (N_t, M + 1, D)
-                    mask = torch.cat([memory_mask_t, torch.zeros(N_t, 1, device=device).bool()], dim=1)        # (N_t, M + 1)
-                    qkv = self.memory_attention[i](qkv + self.t_embedding,
-                                                    qkv + self.t_embedding,
-                                                    qkv,
-                                                    mask, attention_bias=memory_bias)
-                    q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N_t, D)
-                    memory = qkv[:, :-1]                                            # (N_t, M, D)
-                    # === === ===
-
-                q_t = self.projection1(q_t)
+                q_t = self._decode_queries(q_t, f_fused_t, bank, rgb_bank, p_mask=0)
                 # === === ===
 
                 # === Re-ranking ===
@@ -501,27 +480,18 @@ class Track_On2(nn.Module):
 
                 p_patch, o, v_logit, u_logit, _, _ = self._predict_position(
                     q_t, (f4_t, f8_t, f16_t, f32_t), p_patch_top_k, s_logit_top_k,
-                    point_memory[b, available_queries].clone(), history_t, memory_mask_t)
+                    bank.values, history_t, memory_mask_t)
                 # === === ===
 
                 P[b, t, available_queries] = p_patch[0] + o[-1]                   # (1, N_t, 2)
                 V_logit[b, t, available_queries] = v_logit.float()                # (N)
                 U_logit[b, t, available_queries] = u_logit.float()                # (N)
 
-                # === Updates ===
-                # Update Memory
-                point_memory_slice = torch.zeros(N, 1, D, device=device, dtype=q_t.dtype)  # (N, 1, D)
-                point_memory_slice[available_queries] = q_t.clone().view(N_t, 1, D)
-                point_memory[b] = torch.cat([point_memory[b, :, 1:], point_memory_slice], dim=1)                # (N, M, D)
-
-                if trajectory_history is not None:
-                    history_slice = trajectory_history.new_zeros(N, 1, 4)
-                    history_slice[available_queries, 0] = trajectory_entry(
-                        p_patch[0] + o[-1], v_logit, u_logit, self.input_size)
-                    trajectory_history[b] = torch.cat((trajectory_history[b, :, 1:], history_slice), dim=1)
-
-                # Update Temporal Mask
-                temporal_mask[b] = torch.cat([temporal_mask[b, :, 1:], ~available_queries.view(N, 1)], dim=1)   # (N, M)
+                entry = (trajectory_entry(p_patch[0] + o[-1], v_logit, u_logit, self.input_size)
+                         if self.uses_history else None)
+                memories[b] = memories[b].append(q_t[0], entry, available_queries)
+                if rgb_memories is not None:
+                    rgb_memories[b] = rgb_memories[b].append(q_t[0], entry, available_queries)
 
         # === Output ===
         P[..., 0] = (P[..., 0] / self.W) * W_in
@@ -575,7 +545,7 @@ class Track_On2(nn.Module):
 
     @torch.no_grad()
     def track_frame(self, q_init, temporal_mask, point_memory, frame_features, H_in, W_in,
-                    trajectory_history=None, return_uncertainty=False):
+                    trajectory_history=None, return_uncertainty=False, rgb_memory=None):
         """
         Track queries through one frame using pre-extracted features.
         
@@ -589,50 +559,13 @@ class Track_On2(nn.Module):
         :args return_uncertainty: Include uncertainty logits in the returned tuple
         :return: (p, v_logit, q_new) where p is (N, 2), v_logit is (N,), q_new is (N, D)
         """
-        N, D = q_init.shape
-        M = point_memory.shape[1]
-        
         f4_t, f8_t, f16_t, f32_t, f_fused_t = frame_features
-        device = f4_t.device
 
-        q_t = q_init.unsqueeze(0).clone()                  # (1, N, D)
-        memory_mask_t = temporal_mask.clone()              # (N, M)
-        memory = point_memory.clone()                      # (N, M, D)
-        history_t = trajectory_history
-        memory_bias = self._memory_bias(history_t)
-
-        # === Query Decoder ===
-        # Pre-allocate buffers for efficiency
-        qkv = torch.zeros(N, M + 1, D, device=device, dtype=memory.dtype)
-        qkv[:, :-1] = memory  # Fill memory part once
-        mask = torch.zeros(N, M + 1, device=device, dtype=torch.bool)
-        mask[:, :-1] = memory_mask_t
-        mask[:, -1] = False  # Query position is never masked
-        
-        for i in range(self.decoder_layer_num):
-            # === Attention to frame features ===
-            q_t = self.feature_attention[i](q_t, 
-                                        f_fused_t, 
-                                        f_fused_t)              # (1, N, D)
-            # === === ===
-
-            # === Attention to other queries ===
-            q_t = self.query_attention[i](q_t, q_t, q_t)        # (1, N, D)
-            # === === ===
-
-            # === Attention to memory ===
-            q_t_view = q_t.view(N, D)                           # (N, D)
-
-            qkv[:, -1] = q_t_view  # Update only the query position
-            qkv = self.memory_attention[i](qkv + self.t_embedding,
-                                            qkv + self.t_embedding,
-                                            qkv,
-                                            mask, attention_bias=memory_bias)
-            q_t = qkv[:, -1].unsqueeze(0)                                   # (1, N, D)
-            qkv[:, :-1] = qkv[:, :-1].clone()  # Preserve memory for next iteration
-            # === === ===
-
-        q_t = self.projection1(q_t)
+        if self.rgb_memory_reader is not None and rgb_memory is None:
+            raise ValueError("Dual memory requires the point's RGB history")
+        bank = PointMemory(point_memory, temporal_mask, trajectory_history)
+        memory_mask_t, history_t = bank.mask, bank.history
+        q_t = self._decode_queries(q_init.unsqueeze(0), f_fused_t, bank, rgb_memory)
         # === === ===
 
         # === Re-ranking ===

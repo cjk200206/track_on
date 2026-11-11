@@ -71,8 +71,8 @@ def resolve_memory_policy(config, memory_size):
     kind = policy.get("type", "fifo")
     if kind == "fifo":
         return dict(type=kind, recent_size=memory_size, rgb_size=0)
-    if kind != "recent_rgb":
-        raise ValueError("memory_policy.type must be fifo or recent_rgb")
+    if kind not in {"recent_rgb", "dual"}:
+        raise ValueError("memory_policy.type must be fifo, recent_rgb or dual")
     recent_size = policy.get("recent_size", 24)
     rgb_size = policy.get("rgb_size", 48)
     if type(recent_size) is not int or recent_size < 1:
@@ -81,6 +81,8 @@ def resolve_memory_policy(config, memory_size):
         raise ValueError("memory_policy.rgb_size must be a nonnegative integer")
     if recent_size + rgb_size != memory_size:
         raise ValueError("memory_policy sizes must sum to inference_memory_size")
+    if kind == "dual" and rgb_size == 0:
+        raise ValueError("The dual policy requires a positive RGB memory size")
     return dict(type=kind, recent_size=recent_size, rgb_size=rgb_size)
 
 
@@ -232,10 +234,15 @@ def main():
             model_args = Namespace(**json.load(file)["args"])
     else:
         model_args = load_args_from_yaml(str(model_config_path))
-    if "inference_memory_size" in config:
-        model_args.M_i = int(config["inference_memory_size"])
-    memory_size = getattr(model_args, "M_i", 72)
+    dual_memory = getattr(model_args, "rgb_memory_size", 0) > 0
+    default_size = model_args.M + model_args.rgb_memory_size if dual_memory else getattr(model_args, "M_i", 72)
+    memory_size = int(config.get("inference_memory_size", default_size))
     memory_policy = resolve_memory_policy(config, memory_size)
+    if (memory_policy["type"] == "dual") != dual_memory:
+        raise ValueError("The dual inference policy requires a matching dual-memory model_config")
+    model_args.M_i = memory_policy["recent_size"] if dual_memory else memory_size
+    if dual_memory:
+        model_args.rgb_memory_size_i = memory_policy["rgb_size"]
     if config.get("input_mode", "rgb") == "frame_event" and not getattr(model_args, "event_channels", 0):
         raise ValueError("frame_event input requires model_config with event_channels")
     if getattr(model_args, "vit_pretrained_path", None):

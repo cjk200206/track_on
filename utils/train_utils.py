@@ -32,8 +32,7 @@ def load_args_from_yaml(yaml_path: str):
     with open(yaml_path, "r") as f:
         cfg = yaml.safe_load(f)
 
-    args = Namespace(**cfg)
-    return args
+    return Namespace(**cfg)
 
 def get_dataloaders(args, train_set="kubric"):
     def seed_worker(worker_id):
@@ -203,7 +202,8 @@ def load_pretrained_weights(model, checkpoint_path, extra_allowed_missing_prefix
     if unexpected:
         raise RuntimeError(f"Unexpected keys in checkpoint (not present in model): {unexpected}")
 
-    allowed_missing_prefixes = ALLOWED_MISSING_PREFIXES + tuple(extra_allowed_missing_prefixes)
+    allowed_missing_prefixes = (ALLOWED_MISSING_PREFIXES + tuple(extra_allowed_missing_prefixes)
+                                + tuple(getattr(model, "pretrained_memory_prefixes", ())))
     disallowed_missing = [
         k for k in missing
         if not any(k.startswith(pfx) for pfx in allowed_missing_prefixes)
@@ -215,6 +215,8 @@ def load_pretrained_weights(model, checkpoint_path, extra_allowed_missing_prefix
             f"Disallowed missing keys:\n  {disallowed_missing}\n"
             f"(Allowed missing prefixes: {allowed_missing_prefixes})")
 
+    if hasattr(model, "initialize_missing_memory"):
+        model.initialize_missing_memory(missing)
     print(f"Loaded model weights from {checkpoint_path}")
     if missing:
         prefixes = {".".join(key.split(".")[:3]) for key in missing}

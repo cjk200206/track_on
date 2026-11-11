@@ -19,6 +19,8 @@ class RGBMemoryPredictor(Predictor):
         self.recent_size = recent_size
         self.rgb_size = rgb_size
         super().__init__(model_args, checkpoint_path, support_grid_size)
+        if self.model.rgb_memory_size:
+            raise ValueError("The legacy recent_rgb policy cannot wrap a dual-memory model")
         if self.model.M != recent_size + rgb_size:
             raise ValueError("recent_size + rgb_size must equal inference memory size")
 

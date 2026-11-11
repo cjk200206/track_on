@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from utils.coord_utils import get_points_on_a_grid
 from utils.train_utils import load_pretrained_weights
 from model.trajectory_history import trajectory_entry
+from model.point_memory import PointMemory
 
 
 class Predictor(torch.nn.Module):
@@ -20,9 +21,14 @@ class Predictor(torch.nn.Module):
             load_pretrained_weights(self.model, checkpoint_path, extra_allowed_missing_prefixes=allowed)
 
         # Optional inference-time memory extension
-        ime_size = getattr(model_args, "M_i", 72)
+        ime_size = getattr(model_args, "M_i", self.model.M if self.model.rgb_memory_size else 72)
         if ime_size != model_args.M:
             self.model.memory_extension(ime_size)
+
+        if self.model.rgb_memory_reader is not None:
+            rgb_size = getattr(model_args, "rgb_memory_size_i", self.model.rgb_memory_size)
+            if rgb_size != self.model.rgb_memory_size:
+                self.model.rgb_memory_reader.extend(rgb_size)
 
         self.model.eval()
 
@@ -50,12 +56,24 @@ class Predictor(torch.nn.Module):
 
         return Args()
 
+    # Legacy inference policies still access these recent-history buffers.
+    @property
+    def point_memory(self):
+        return None if self.memory is None else self.memory.values
+
+    @property
+    def temporal_mask(self):
+        return None if self.memory is None else self.memory.mask
+
+    @property
+    def trajectory_history(self):
+        return None if self.memory is None else self.memory.history
+
     def reset(self):
         """Reset all tracking state to start fresh."""
         self.t = 0
-        self.point_memory = None
-        self.trajectory_history = None
-        self.temporal_mask = None
+        self.memory = None
+        self.rgb_memory = None
         self.q_init = None
         self.N = 0                      # Number of active queries
         self.capacity = 0               # Buffer capacity
@@ -100,53 +118,27 @@ class Predictor(torch.nn.Module):
         q_new = q_new.squeeze(-1).squeeze(0).permute(1, 0)  # (N_new, D)
         # === === ===
 
-        # Initialize memory structures
-        M = self.model.M
-        D = self.model.D
-
-        if self.q_init is None:
-            # First initialization - allocate buffer with extra capacity
-            self.capacity = max(self.initial_capacity, N_new)
-            self.q_init = torch.zeros(self.capacity, D, device=device)
-            self.point_memory = torch.zeros(self.capacity, M, D, device=device)
-            self.temporal_mask = torch.ones(self.capacity, M, device=device, dtype=torch.bool)
-            if self.model.uses_history:
-                self.trajectory_history = torch.zeros(self.capacity, M, 4, device=device)
-
-            # Fill in the actual data
-            self.q_init[:N_new] = q_new
-            self.N = N_new
-            self.device = device
-        else:
-            # Check if we need to expand the buffer
-            if self.N + N_new > self.capacity:
-                # Double the capacity (or more if needed)
-                new_capacity = max(self.capacity * 2, self.N + N_new)
-
-                # Allocate new buffers
-                new_q_init = torch.zeros(new_capacity, D, device=device)
-                new_point_memory = torch.zeros(new_capacity, M, D, device=device)
-                new_temporal_mask = torch.ones(new_capacity, M, device=device, dtype=torch.bool)
-
-                # Copy existing data
-                new_q_init[:self.N] = self.q_init[:self.N]
-                new_point_memory[:self.N] = self.point_memory[:self.N]
-                new_temporal_mask[:self.N] = self.temporal_mask[:self.N]
-
-                # Update references
-                self.q_init = new_q_init
-                self.point_memory = new_point_memory
-                self.temporal_mask = new_temporal_mask
-                self.capacity = new_capacity
-                if self.trajectory_history is not None:
-                    new_history = self.trajectory_history.new_zeros(new_capacity, M, 4)
-                    new_history[:self.N] = self.trajectory_history[:self.N]
-                    self.trajectory_history = new_history
-
-            # Add new queries using in-place indexing (no concatenation needed)
-            self.q_init[self.N:self.N + N_new] = q_new
-            # point_memory and temporal_mask are already initialized with zeros/ones
-            self.N += N_new
+        required = self.N + N_new
+        if required > self.capacity or self.q_init is None:
+            capacity = max(self.initial_capacity, self.capacity * 2, required)
+            queries_buffer = torch.zeros(capacity, self.model.D, device=device)
+            if self.q_init is not None:
+                queries_buffer[:self.N] = self.q_init[:self.N]
+            self.q_init = queries_buffer
+            if self.memory is None:
+                self.memory = PointMemory.empty(self.q_init, capacity, self.model.M,
+                                                self.model.D, self.model.uses_history)
+                if self.model.rgb_memory_size:
+                    self.rgb_memory = PointMemory.empty(self.q_init, capacity, self.model.rgb_memory_size,
+                                                        self.model.D, self.model.uses_history)
+            else:
+                self.memory = self.memory.grow(capacity)
+                if self.rgb_memory is not None:
+                    self.rgb_memory = self.rgb_memory.grow(capacity)
+            self.capacity = capacity
+        self.q_init[self.N:required] = q_new
+        self.N = required
+        self.device = device
 
     @torch.no_grad()
     def forward_frame(self, frame, new_queries=None, events=None, img_ifnew=None):
@@ -162,6 +154,10 @@ class Predictor(torch.nn.Module):
         """
         device = frame.device
         _, _, H, W = frame.shape
+
+        if self.model.rgb_memory_size and events is not None and img_ifnew is None:
+            raise ValueError("Dual FE memory requires explicit img_ifnew")
+        new_rgb = events is None if img_ifnew is None else bool(img_ifnew)
 
         # Extract features once
         f4_t, f8_t, f16_t, f32_t, f_fused_t = self.model.extract_frame_features(
@@ -187,16 +183,18 @@ class Predictor(torch.nn.Module):
             W,
             trajectory_history=None if self.trajectory_history is None else self.trajectory_history[:self.N],
             return_uncertainty=True,
+            rgb_memory=None if self.rgb_memory is None else self.rgb_memory.select(slice(0, self.N)),
         )
 
-        # Shift memory left and add new feature at the end (in-place using roll for efficiency)
-        self.point_memory[:self.N] = torch.roll(self.point_memory[:self.N], shifts=-1, dims=1)
-        self.point_memory[:self.N, -1] = q_new
-        if self.trajectory_history is not None:
-            self.trajectory_history[:self.N] = torch.roll(self.trajectory_history[:self.N], shifts=-1, dims=1)
-            self.trajectory_history[:self.N, -1] = trajectory_entry(p, v_logit, u_logit, (H, W))
-        self.temporal_mask[:self.N] = torch.roll(self.temporal_mask[:self.N], shifts=-1, dims=1)
-        self.temporal_mask[:self.N, -1] = False
+        entry = (trajectory_entry(p, v_logit, u_logit, (H, W)) if self.model.uses_history else None)
+        # Update active points only; unused capacity stays empty for future queries.
+        for bank, write in ((self.memory, True), (self.rgb_memory, new_rgb)):
+            if bank is not None and write:
+                updated = bank.select(slice(0, self.N)).append(q_new, entry)
+                bank.values[:self.N] = updated.values
+                bank.mask[:self.N] = updated.mask
+                if bank.history is not None:
+                    bank.history[:self.N] = updated.history
 
         # Get visibility
         v_t = (v_logit.sigmoid() >= self.delta_v)  # (N,)

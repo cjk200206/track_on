@@ -1,0 +1,42 @@
+# Scheme 2: recent FIFO plus independently written/read RGB history.
+dataset_root: /remote-home/share/cjk/track_on/data/TAPFormer_Dataset
+input_mode: frame_event
+model_config: config/train_frame_event_dual_memory.yaml
+# Replace RUN with the training output timestamp.
+checkpoint: outputs/frame_event_dual_memory_ft/20261104_022920_710949/best_pseudo.pt
+output_dir: outputs/real_tapformer_dual_memory_ft/20261104_022920_710949
+csv_filename: summary.csv
+
+sequences:
+  InivTAP:
+    - ID_Fast_Fruit
+    - ID_Dark_Fruit
+    - ID_OverExp_Fruit
+    - ID_OverExp_Fruit2
+    - ID_Dynamic_Robot
+    - OD_Dynamic
+    - OD_Static
+    - OD_Basketball
+  DrivTAP:
+    - Day_Tunnel
+    - Day_Bridge
+    - Day_Fast
+    - Night_Road
+    - Night_Fast
+
+event_dt:
+  InivTAP: rgb_aligned_20ms_max6
+  DrivTAP: rgb_aligned_2
+drivtap_gt_mode: downsample_even
+support_grid_size: 0
+local_support_radius: 8
+inference_memory_size: 72
+memory_policy:
+  type: dual
+  recent_size: 48
+  rgb_size: 24
+device: cuda:0
+amp: true
+save_predictions: false
+visualization:
+  enabled: true

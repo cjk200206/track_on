@@ -1,0 +1,75 @@
+# Scheme 2: recent FIFO plus independently written/read RGB history.
+erf_root: /remote-home/share/cjk/track_on/data/erf_x170/train
+erf_event_root: /remote-home/share/cjk/track_on/data/erf_x170/erf_time_surfaces/train/stride_4
+erf_label_root: /remote-home/share/cjk/track_on/data/erf_x170/erf_pseudo_labels/train/stride_2_t96
+checkpoint_path: outputs/frame_event_real_ft/20261031_213525_985288/best_pseudo.pt
+output_dir: outputs/frame_event_dual_memory_ft
+
+# Fixed 1:1 synthetic/real sampling with constant loss weights.
+# Disable syn_real_training to use only ERF; disable schedule_syn_weight for constant weights.
+syn_real_training: true
+schedule_syn_weight: false
+event_kubric_root: /remote-home/share/cjk/track_on/data/event_kubric
+event_kubric_sources:
+  - {name: train_batch, weight: 24, val_fraction: 0.1}
+  - {name: train_seq, weight: 24, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 16, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 16, val_fraction: 0.1}
+  - {name: fast_batch, weight: 6, val_fraction: 0.1}
+  - {name: fast_seq, weight: 6, val_fraction: 0.1}
+  - {name: fast_batch_panning, weight: 4, val_fraction: 0.1}
+  - {name: fast_seq_panning, weight: 4, val_fraction: 0.1}
+# Synthetic clips retain pretraining geometry augmentation; ERF uses RGB photometric augmentation only.
+spatial_augmentation: true
+spatial_scale_range: [1.0, 1.2]
+photometric_augmentation: true
+
+input_size: [384, 512]
+T: 24
+N: 192
+event_native_stride: 4
+rgb_native_interval: 16
+# Excludes initialization; unknown labels do not count as visible supervision.
+min_visible_fraction: 0.5
+val_fraction: 0.1
+split_seed: 1234
+bs: 1
+num_workers: 4
+val_num_workers: 4
+
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: /remote-home/share/cjk/track_on/checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+grad_checkpoint: true
+event_channels: 10
+event_fusion_type: recurrent
+event_encoder: etap
+event_pretrained_path: /remote-home/share/cjk/track_on/checkpoints/ETAP_v1_cvpr25.pth
+
+# Synthetic GT: all seven losses; real FT: L_p + L_p2 + L_o + L_topk_rank + L_topk_u.
+lambda_patch_cls: 3.0
+# Original tracker memory regularization; does not remove queries or RGB frames.
+memory_mask_probability: 0.1
+epoch_num: 30
+grad_accum_steps: 4
+save_every: 5
+log_every: 20
+lr: 0.00003
+wd: 0.00001
+amp: true
+seed: 1234
+
+# Memory and automatic adaptation settings.
+memory_reliability_weighting: false  # Set true to combine schemes 1 and 2.
+rgb_memory_size: 4  # Set to 8 if needed; independent of recent FIFO size M.
+M_i: 24
+delta_v: 0.8
+adaptation_T: 24  # Prefix length during backend-only adaptation.
+adaptation_steps: 300  # Successful updates; 0 starts joint training immediately.
+memory_lr: 0.0001
