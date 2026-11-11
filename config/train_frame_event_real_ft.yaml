@@ -1,9 +1,28 @@
-# Real-only recurrent FE fine-tuning. Labels are generated offline; no augmentation.
+# Recurrent FE fine-tuning: balanced synthetic GT and real offline pseudo labels.
 erf_root: /remote-home/share/cjk/track_on/data/erf_x170/train
 erf_event_root: /remote-home/share/cjk/track_on/data/erf_x170/erf_time_surfaces/train/stride_4
 erf_label_root: /remote-home/share/cjk/track_on/data/erf_x170/erf_pseudo_labels/train/stride_2_t96
 checkpoint_path: /remote-home/share/cjk/track_on/outputs/frame_event_recurrent/20261019_195720/best.pt
 output_dir: /remote-home/share/cjk/track_on/outputs/frame_event_real_ft
+
+# Fixed 1:1 sampling; Track-On-R loss weights: synthetic 1 -> 0, real 1 -> 2.
+# Disable syn_real_training to use only ERF; disable schedule_syn_weight for constant weights.
+syn_real_training: true
+schedule_syn_weight: true
+event_kubric_root: /remote-home/share/cjk/track_on/data/event_kubric
+event_kubric_sources:
+  - {name: train_batch, weight: 24, val_fraction: 0.1}
+  - {name: train_seq, weight: 24, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 16, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 16, val_fraction: 0.1}
+  - {name: fast_batch, weight: 6, val_fraction: 0.1}
+  - {name: fast_seq, weight: 6, val_fraction: 0.1}
+  - {name: fast_batch_panning, weight: 4, val_fraction: 0.1}
+  - {name: fast_seq_panning, weight: 4, val_fraction: 0.1}
+# Synthetic clips retain pretraining geometry augmentation; ERF uses RGB photometric augmentation only.
+spatial_augmentation: true
+spatial_scale_range: [1.0, 1.2]
+photometric_augmentation: true
 
 input_size: [384, 512]
 T: 24
@@ -33,10 +52,13 @@ event_fusion_type: recurrent
 event_encoder: etap
 event_pretrained_path: /remote-home/share/cjk/track_on/checkpoints/ETAP_v1_cvpr25.pth
 
-# Track-On-R FT: L_p + L_p2 + L_o + L_topk_rank + L_topk_u.
+# Synthetic GT: all seven losses; real FT: L_p + L_p2 + L_o + L_topk_rank + L_topk_u.
 lambda_patch_cls: 3.0
+delta_v: 0.8
 # Original tracker memory regularization; does not remove queries or RGB frames.
 memory_mask_probability: 0.1
+# 1,396 real clips + equal synthetic samples; 4 GPUs x batch 1 x accumulation 4:
+# 698 microbatches/rank, 175 optimizer attempts/epoch, 5,250 attempts in 30 epochs.
 epoch_num: 30
 grad_accum_steps: 4
 save_every: 5

@@ -1,0 +1,90 @@
+# Real FE fine-tuning with synthetic GT, ERF and DSEC offline pseudo labels.
+# Each source starts from its saved query origin and supplies 24 student steps.
+# Split by complete sequence names, never by shared scene prefixes.
+real_sources:
+  - name: erf
+    dataset: erf
+    root: /remote-home/share/cjk/track_on/data/erf_x170/train
+    event_root: /remote-home/share/cjk/track_on/data/erf_x170/erf_time_surfaces/train/stride_4
+    label_root: /remote-home/share/cjk/track_on/data/erf_x170/erf_pseudo_labels/train/stride_2_t96
+    event_native_stride: 4
+    rgb_native_interval: 16
+  - name: dsec
+    dataset: dsec
+    # With split_seed=1234, hold out these complete sequence names:
+    # zurich_city_09_c, zurich_city_09_d, zurich_city_09_e, zurich_city_11_b.
+    root: /remote-home/share/cjk/datasets/DSEC/train
+    event_root: /remote-home/share/cjk/datasets/DSEC/dsec_time_surfaces/train/stride_1
+    label_root: /remote-home/share/cjk/datasets/DSEC/dsec_pseudo_labels/train/stride_1_t48
+    event_native_stride: 1
+    rgb_native_interval: 2
+
+checkpoint_path: /remote-home/share/cjk/track_on/outputs/frame_event_recurrent/20261019_195720/best.pt
+output_dir: /remote-home/share/cjk/track_on/outputs/frame_event_erf_dsec_ft
+
+# Fixed synthetic:ERF:DSEC = 4:4:2; weights below control sampling only.
+syn_real_training: true
+# schedule_syn_weight: true  # Previous: synthetic 1 -> 0, real 1 -> 2.
+schedule_syn_weight: false  # Keep synthetic and real loss weights at 1.
+sampling_weights: {synthetic: 4, erf: 4, dsec: 2}
+updates_per_epoch: 175
+synthetic_frame_interval: 4
+event_kubric_root: /remote-home/share/cjk/track_on/data/event_kubric
+event_kubric_sources:
+  - {name: train_batch, weight: 24, val_fraction: 0.1}
+  - {name: train_seq, weight: 24, val_fraction: 0.1}
+  - {name: train_batch_panning, weight: 16, val_fraction: 0.1}
+  - {name: train_seq_panning, weight: 16, val_fraction: 0.1}
+  - {name: fast_batch, weight: 6, val_fraction: 0.1}
+  - {name: fast_seq, weight: 6, val_fraction: 0.1}
+  - {name: fast_batch_panning, weight: 4, val_fraction: 0.1}
+  - {name: fast_seq_panning, weight: 4, val_fraction: 0.1}
+# Synthetic clips retain geometry augmentation; ERF/DSEC use RGB photometric augmentation only.
+spatial_augmentation: true
+spatial_scale_range: [1.0, 1.2]
+photometric_augmentation: true
+
+input_size: [384, 512]
+T: 24
+N: 192
+# Legacy defaults; the real sources above each set their own frequency.
+event_native_stride: 4
+rgb_native_interval: 16
+# Excludes initialization; unknown labels do not count as visible supervision.
+min_visible_fraction: 0.5
+val_fraction: 0.1
+split_seed: 1234
+bs: 1
+num_workers: 8
+val_num_workers: 8
+
+M: 24
+D: 256
+K: 16
+decoder_layer_num: 3
+predicton_head_layer_num: 3
+rerank_layer_num: 3
+vit_backbone: dinov3_s_plus
+vit_pretrained_path: /remote-home/share/cjk/track_on/checkpoints/dinov3_hf/vits16plus_lvd1689m
+vit_upsample_factor: 1.143
+grad_checkpoint: true
+event_channels: 10
+event_fusion_type: recurrent
+event_encoder: etap
+event_pretrained_path: /remote-home/share/cjk/track_on/checkpoints/ETAP_v1_cvpr25.pth
+
+# Synthetic GT: all seven losses; real FT: L_p + L_p2 + L_o + L_topk_rank + L_topk_u.
+lambda_patch_cls: 3.0
+delta_v: 0.8
+# Original tracker memory regularization; does not remove queries or RGB frames.
+memory_mask_probability: 0.1
+# Fixed budget: 4 GPUs x batch 1 x accumulation 4 = 2,800 samples/epoch.
+# Synthetic 1,120 + ERF 1,120 + DSEC 560; 175 attempts/epoch, 5,250 over 30 epochs.
+epoch_num: 30
+grad_accum_steps: 4
+save_every: 5
+log_every: 20
+lr: 0.00003
+wd: 0.00001
+amp: true
+seed: 1234
